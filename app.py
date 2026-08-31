@@ -26,7 +26,7 @@ class PgConn:
     sqlite3-style c.execute(query, params) convenience method directly
     on the connection object, with '?' placeholders like before."""
     def __init__(self):
-        self._conn = psycopg2.connect(DATABASE_URL)
+        self._conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
     def execute(self, query, params=()):
         cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(query.replace('?', '%s'), params)
