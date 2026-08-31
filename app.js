@@ -1,6 +1,4 @@
 const $=id=>document.getElementById(id); const api=()=>$('api').value.replace(/\/$/,'');
-function closeIntro(){const o=$('introOverlay');if(!o||o.classList.contains('introHide'))return;o.classList.add('introHide');setTimeout(()=>o.remove(),700)}
-(function(){const v=$('introVideo');if(v){v.addEventListener('ended',closeIntro);v.addEventListener('error',closeIntro)}setTimeout(closeIntro,9000)})();
 function msg(x){$('msg').textContent=x; setTimeout(()=>$('msg').textContent='',5000)}
 function show(id){document.querySelectorAll('.page').forEach(x=>x.classList.add('hidden'));$(id).classList.remove('hidden'); if(id==='signals')loadSignals(); if(id==='dash'&&!window.gmChartLoaded)loadTVChart('XAUUSD')}
 function sendContact(){const n=$('contactName').value.trim(),e=$('contactEmail').value.trim(),s=$('contactSubject').value.trim(),m=$('contactMessage').value.trim();if(!n||!e||!m){$('contactStatus').textContent='Please enter your name, email and message.';return} $('contactStatus').textContent='Message prepared. Please connect the contact form to your support email/API in the backend to deliver it.';msg('Contact message ready.')}
