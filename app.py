@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS payments(id SERIAL PRIMARY KEY,user_id INTEGER NOT NU
 CREATE TABLE IF NOT EXISTS signals(id SERIAL PRIMARY KEY,symbol TEXT NOT NULL,direction TEXT NOT NULL,entry REAL,sl REAL,tp1 REAL,tp2 REAL,confidence REAL,reason TEXT,created_at TEXT NOT NULL,status TEXT DEFAULT 'ACTIVE');
 CREATE TABLE IF NOT EXISTS mt5_calendar(id SERIAL PRIMARY KEY,time TEXT,currency TEXT,country TEXT,event TEXT,importance INTEGER,actual REAL,forecast REAL,previous REAL,received_at TEXT NOT NULL);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS license_key TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS signals_viewed_count INTEGER DEFAULT 0;
 '''); c.commit(); c.close()
     except Exception as e:
         print('WARNING: could not connect to DATABASE_URL at startup: ' + str(e) +
@@ -79,9 +80,9 @@ def otp(email,purpose):
 def register():
     d=request.get_json(force=True); req=['full_name','email','username','password','mt5_account']
     if any(not str(d.get(k,'')).strip() for k in req): return jsonify(ok=False,error='Missing required field'),400
-    email=d['email'].strip().lower(); c=db(); license_key=secrets.token_hex(16)
+    email=d['email'].strip().lower(); c=db(); license_key=secrets.token_hex(16); trial_expiry=(now()+timedelta(days=3)).isoformat()
     try:
-        c.execute('INSERT INTO users(full_name,email,phone,username,password_hash,mt5_account,created_at,license_key) VALUES(?,?,?,?,?,?,?,?)',(d['full_name'].strip(),email,d.get('phone','').strip(),d['username'].strip(),h(d['password']),str(d['mt5_account']),now().isoformat(),license_key)); c.commit()
+        c.execute('INSERT INTO users(full_name,email,phone,username,password_hash,mt5_account,created_at,license_key,membership,membership_expiry) VALUES(?,?,?,?,?,?,?,?,?,?)',(d['full_name'].strip(),email,d.get('phone','').strip(),d['username'].strip(),h(d['password']),str(d['mt5_account']),now().isoformat(),license_key,'FREE',trial_expiry)); c.commit()
     except psycopg2.IntegrityError: c.close(); return jsonify(ok=False,error='Email or username already exists'),409
     c.close(); code=otp(email,'REGISTER'); send_email(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.'); admin_email('New GOLD MASTERS registration',f'User: {d["full_name"]}\nEmail: {email}\nMT5: {d["mt5_account"]}\nStatus: PENDING'); return jsonify(ok=True,message='Check email for OTP')
 
@@ -107,8 +108,34 @@ def payment():
     if not u: c.close(); return jsonify(ok=False,error='User not found'),404
     c.execute('INSERT INTO payments(user_id,kind,amount,currency,method,reference,destination,created_at) VALUES(?,?,?,?,?,?,?,?)',(u['id'],kind,amount,d.get('currency','USD'),d.get('method',''),d.get('reference',''),d.get('destination',''),now().isoformat())); c.commit(); c.close(); send_email(email,f'GOLD MASTERS {kind.title()} Request',f'Amount: {amount} {d.get("currency","USD")}\nStatus: PENDING ADMIN CONFIRMATION'); admin_email(f'New {kind}',f'User: {u["full_name"]}\nEmail: {email}\nAmount: {amount}'); return jsonify(ok=True,status='PENDING')
 
+PRICING={'MONTHLY':50,'SIX_MONTH':200,'YEARLY':400,'LIFETIME':1000}
+@app.get('/api/pricing')
+def pricing(): return jsonify(ok=True,pricing=PRICING,trial='3 days or 3 signals, whichever comes first',currency='USD')
+
 @app.get('/api/signals')
-def signals(): return jsonify(ok=True,signals=rows("SELECT * FROM signals WHERE status='ACTIVE' ORDER BY id DESC LIMIT 100"))
+def signals():
+    email=request.args.get('email','').strip().lower()
+    all_signals=rows("SELECT * FROM signals WHERE status='ACTIVE' ORDER BY id DESC LIMIT 100")
+    if not email:
+        return jsonify(ok=True,signals=[],trial=True,error='Login required to view signals. Free trial: 3 days or 3 signals.',pricing=PRICING)
+    c=db(); u=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
+    if not u: c.close(); return jsonify(ok=False,error='User not found'),404
+    paid=u['membership'] in ('MONTHLY','SIX_MONTH','YEARLY','LIFETIME')
+    expired=False
+    if u['membership_expiry']:
+        try:
+            if datetime.fromisoformat(u['membership_expiry'])<now(): expired=True
+        except ValueError: pass
+    if paid and not expired:
+        c.close(); return jsonify(ok=True,signals=all_signals,trial=False)
+    # FREE / trial user
+    if paid and expired:
+        c.close(); return jsonify(ok=True,signals=[],trial=True,error='Your membership has expired. Please renew to keep receiving signals.',pricing=PRICING)
+    if expired or u['signals_viewed_count']>=3:
+        c.close(); return jsonify(ok=True,signals=[],trial=True,error='Free trial ended (3 days or 3 signals). Upgrade to keep receiving signals.',pricing=PRICING)
+    remaining=3-u['signals_viewed_count']
+    c.execute('UPDATE users SET signals_viewed_count=signals_viewed_count+1 WHERE id=?',(u['id'],)); c.commit(); c.close()
+    return jsonify(ok=True,signals=all_signals[:1],trial=True,trial_signals_remaining=remaining-1,pricing=PRICING)
 @app.get('/api/market/symbols')
 def symbols():
     return jsonify(ok=True,provider=os.getenv('MARKET_DATA_PROVIDER','none'),symbols=['XAUUSD','XAGUSD','EURUSD','GBPUSD','USDJPY','USDCHF','USDCAD','AUDUSD','NZDUSD','EURJPY','GBPJPY','BTCUSD','ETHUSD','NAS100','US30','SPX500','GER40'])
