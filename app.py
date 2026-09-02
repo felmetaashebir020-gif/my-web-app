@@ -13,8 +13,6 @@ if DATABASE_URL.startswith('postgres://'):
 OTP_MINUTES = int(os.getenv('OTP_MINUTES', '10'))
 
 class PgCursorWrapper:
-    """Wraps a psycopg2 cursor so call sites can keep doing
-    c.execute(...).fetchone() / .fetchall() like they did with sqlite3."""
     def __init__(self, cur): self._cur = cur
     def fetchone(self):
         r = self._cur.fetchone(); return dict(r) if r is not None else None
@@ -22,9 +20,6 @@ class PgCursorWrapper:
         return [dict(r) for r in self._cur.fetchall()]
 
 class PgConn:
-    """Wraps a psycopg2 connection so call sites can keep using the
-    sqlite3-style c.execute(query, params) convenience method directly
-    on the connection object, with '?' placeholders like before."""
     def __init__(self):
         self._conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
     def execute(self, query, params=()):
@@ -67,8 +62,13 @@ def send_email(to,subject,body):
     if not host or not user or not password:
         print('EMAIL NOT CONFIGURED',subject,to); return False
     msg=EmailMessage(); msg['From']=sender; msg['To']=to; msg['Subject']=subject; msg.set_content(body)
-    with smtplib.SMTP(host,port) as s: s.starttls(); s.login(user,password); s.send_message(msg)
-    return True
+    try:
+        with smtplib.SMTP(host,port,timeout=15) as s:
+            s.starttls(); s.login(user,password); s.send_message(msg)
+        return True
+    except Exception as e:
+        print('EMAIL SEND FAILED:', str(e))
+        return False
 
 def admin_email(s,b):
     if os.getenv('ADMIN_EMAIL',''): send_email(os.getenv('ADMIN_EMAIL'),s,b)
@@ -91,6 +91,17 @@ def verify():
     d=request.get_json(force=True); email=d.get('email','').strip().lower(); code=d.get('code','').strip(); c=db(); r=c.execute("SELECT * FROM otps WHERE email=? AND purpose='REGISTER' AND used=0 ORDER BY id DESC LIMIT 1",(email,)).fetchone()
     if not r or r['expires_at']<now().isoformat() or r['code_hash']!=h(code): c.close(); return jsonify(ok=False,error='Invalid or expired code'),400
     c.execute('UPDATE otps SET used=1 WHERE id=?',(r['id'],)); c.execute('UPDATE users SET email_verified=1 WHERE email=?',(email,)); c.commit(); c.close(); admin_email('Email verified',f'{email} verified email and awaits admin approval.'); return jsonify(ok=True,status='PENDING')
+
+@app.post('/api/resend-otp')
+def resend_otp():
+    d=request.get_json(force=True); email=d.get('email','').strip().lower()
+    c=db(); u=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
+    if not u: c.close(); return jsonify(ok=False,error='User not found'),404
+    if u['email_verified']: c.close(); return jsonify(ok=False,error='Already verified'),400
+    c.close()
+    code=otp(email,'REGISTER')
+    sent=send_email(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.')
+    return jsonify(ok=True,email_sent=sent)
 
 @app.post('/api/login')
 def login():
@@ -128,7 +139,6 @@ def signals():
         except ValueError: pass
     if paid and not expired:
         c.close(); return jsonify(ok=True,signals=all_signals,trial=False)
-    # FREE / trial user
     if paid and expired:
         c.close(); return jsonify(ok=True,signals=[],trial=True,error='Your membership has expired. Please renew to keep receiving signals.',pricing=PRICING)
     if expired or u['signals_viewed_count']>=3:
@@ -136,9 +146,11 @@ def signals():
     remaining=3-u['signals_viewed_count']
     c.execute('UPDATE users SET signals_viewed_count=signals_viewed_count+1 WHERE id=?',(u['id'],)); c.commit(); c.close()
     return jsonify(ok=True,signals=all_signals[:1],trial=True,trial_signals_remaining=remaining-1,pricing=PRICING)
+
 @app.get('/api/market/symbols')
 def symbols():
     return jsonify(ok=True,provider=os.getenv('MARKET_DATA_PROVIDER','none'),symbols=['XAUUSD','XAGUSD','EURUSD','GBPUSD','USDJPY','USDCHF','USDCAD','AUDUSD','NZDUSD','EURJPY','GBPJPY','BTCUSD','ETHUSD','NAS100','US30','SPX500','GER40'])
+
 def td_symbol(symbol):
     m={
       'XAUUSD':'XAU/USD','XAGUSD':'XAG/USD','EURUSD':'EUR/USD','GBPUSD':'GBP/USD',
@@ -178,13 +190,10 @@ def history(symbol):
 
 @app.get('/api/calendar')
 def calendar():
-    # Preferred source: MT5 built-in economic calendar pushed by the EA.
-    # This avoids a paid Trading Economics API for the GOLD MASTERS calendar.
     rows_mt5=rows('SELECT time,currency,country,event,importance,actual,forecast,previous,received_at FROM mt5_calendar ORDER BY time ASC LIMIT 200')
     if rows_mt5:
         return jsonify(ok=True,provider='MT5 Built-in Economic Calendar',events=rows_mt5)
 
-    # Optional legacy provider fallback if configured.
     key=os.getenv('TRADING_ECONOMICS_API_KEY','').strip()
     if not key:
         return jsonify(ok=False,error='MT5 calendar has no pushed events yet. Attach/run the GOLD MASTERS EA with PushCalendarToDashboard=true, or configure another calendar provider.',provider='MT5 Built-in Economic Calendar'),503
@@ -220,16 +229,19 @@ def calendar_mt5():
 def admin_users():
     if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
     return jsonify(ok=True,users=rows('SELECT id,full_name,email,username,mt5_account,email_verified,status,membership,membership_expiry,created_at,last_login,wallet_balance,license_key FROM users ORDER BY id DESC'))
+
 @app.get('/api/admin/payments')
 def admin_payments():
     if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
     return jsonify(ok=True,payments=rows('SELECT payments.*,users.full_name,users.email FROM payments JOIN users ON users.id=payments.user_id ORDER BY payments.id DESC'))
+
 @app.post('/api/admin/user-status')
 def admin_status():
     if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
     d=request.get_json(force=True); status=d.get('status','').upper(); email=d.get('email','').strip().lower()
     if status not in ('APPROVED','REJECTED','SUSPENDED'): return jsonify(ok=False,error='Invalid status'),400
     c=db(); c.execute('UPDATE users SET status=? WHERE email=?',(status,email)); c.commit(); c.close(); send_email(email,'GOLD MASTERS account update',f'Your account status is now: {status}'); return jsonify(ok=True,status=status)
+
 @app.post('/api/admin/payment-status')
 def admin_payment():
     if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
@@ -242,18 +254,20 @@ def admin_payment():
     c.execute('UPDATE payments SET status=? WHERE id=?',(status,pid))
     if status=='APPROVED': c.execute('UPDATE users SET wallet_balance=wallet_balance+? WHERE id=?',((p['amount'] if p['kind']=='DEPOSIT' else -p['amount']),p['user_id']))
     c.commit(); c.close(); send_email(p['email'],'GOLD MASTERS request update',f'Your {p["kind"].lower()} request #{pid} is {status}.'); return jsonify(ok=True,status=status)
+
 @app.post('/api/admin/signal')
 def admin_signal():
     if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
     d=request.get_json(force=True); direction=d.get('direction','WAIT').upper()
     if direction not in ('BUY','SELL','WAIT'): return jsonify(ok=False,error='Invalid direction'),400
     c=db(); c.execute('INSERT INTO signals(symbol,direction,entry,sl,tp1,tp2,confidence,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(d.get('symbol','XAUUSD').upper(),direction,d.get('entry'),d.get('sl'),d.get('tp1'),d.get('tp2'),d.get('confidence'),d.get('reason',''),now().isoformat())); c.commit(); c.close(); return jsonify(ok=True)
+
 @app.post('/api/admin/membership')
 def admin_membership():
     if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
     d=request.get_json(force=True); email=d.get('email','').strip().lower(); membership=d.get('membership','').upper()
     if membership not in ('FREE','MONTHLY','SIX_MONTH','YEARLY','LIFETIME'): return jsonify(ok=False,error='Invalid membership'),400
-    expiry=d.get('membership_expiry')  # ISO datetime string, e.g. 2026-12-31T23:59:59+00:00, or null for LIFETIME/FREE
+    expiry=d.get('membership_expiry')
     c=db(); u=c.execute('SELECT id FROM users WHERE email=?',(email,)).fetchone()
     if not u: c.close(); return jsonify(ok=False,error='User not found'),404
     c.execute('UPDATE users SET membership=?, membership_expiry=? WHERE email=?',(membership,expiry,email)); c.commit(); c.close()
@@ -262,8 +276,6 @@ def admin_membership():
 
 @app.get('/api/mt5/verify')
 def mt5_verify():
-    # Called periodically by the MT5 EA to confirm membership/wallet status
-    # live from the server instead of trusting local EA input parameters.
     account=request.args.get('account','').strip(); key=request.args.get('key','').strip()
     if not account or not key: return jsonify(ok=False,error='Missing account or key'),400
     c=db(); u=c.execute('SELECT * FROM users WHERE mt5_account=? AND license_key=?',(account,key)).fetchone(); c.close()
@@ -299,5 +311,5 @@ def admin_db_check():
     return jsonify(ok=True,connected=True,postgres_version=version,
                    users=user_count,payments=payment_count,signals=signal_count)
 
-init()  # create tables on import, so this also runs under gunicorn/production, not just `python app.py`
+init()
 if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.getenv('PORT','8000')))
