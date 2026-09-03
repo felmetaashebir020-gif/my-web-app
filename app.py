@@ -1,5 +1,14 @@
 import os, secrets, hashlib, smtplib, requests
 import psycopg2, psycopg2.extras
+import socket
+
+# --- Force IPv4 for outbound connections (fixes "Network is unreachable" on Render) ---
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(*args, **kwargs):
+    return [r for r in _orig_getaddrinfo(*args, **kwargs) if r[0] == socket.AF_INET]
+socket.getaddrinfo = _ipv4_getaddrinfo
+# ---------------------------------------------------------------------------------------
+
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from flask import Flask, request, jsonify
