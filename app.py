@@ -288,6 +288,16 @@ def admin_membership():
     send_email(email,'GOLD MASTERS membership update',f'Your membership is now: {membership}'+(f' (expires {expiry})' if expiry else ''))
     return jsonify(ok=True,membership=membership,membership_expiry=expiry)
 
+@app.post('/api/admin/mt5-account')
+def admin_mt5_account():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True); email=d.get('email','').strip().lower(); mt5_account=str(d.get('mt5_account','')).strip()
+    if not mt5_account: return jsonify(ok=False,error='Missing mt5_account'),400
+    c=db(); u=c.execute('SELECT id FROM users WHERE email=?',(email,)).fetchone()
+    if not u: c.close(); return jsonify(ok=False,error='User not found'),404
+    c.execute('UPDATE users SET mt5_account=? WHERE email=?',(mt5_account,email)); c.commit(); c.close()
+    return jsonify(ok=True,email=email,mt5_account=mt5_account)
+
 @app.get('/api/mt5/verify')
 def mt5_verify():
     account=request.args.get('account','').strip(); key=request.args.get('key','').strip()
