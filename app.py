@@ -67,13 +67,18 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS signals_viewed_count INTEGER DEFAULT 
               'Check /api/admin/db-check once deployed.')
 
 def send_email(to,subject,body):
-    host=os.getenv('SMTP_HOST',''); user=os.getenv('SMTP_USER',''); password=os.getenv('SMTP_PASSWORD',''); sender=os.getenv('SMTP_FROM',user); port=int(os.getenv('SMTP_PORT','587'))
-    if not host or not user or not password:
+    api_key=os.getenv('RESEND_API_KEY','')
+    sender=os.getenv('SMTP_FROM','onboarding@resend.dev')
+    if not api_key:
         print('EMAIL NOT CONFIGURED',subject,to); return False
-    msg=EmailMessage(); msg['From']=sender; msg['To']=to; msg['Subject']=subject; msg.set_content(body)
     try:
-        with smtplib.SMTP(host,port,timeout=15) as s:
-            s.starttls(); s.login(user,password); s.send_message(msg)
+        r=requests.post('https://api.resend.com/emails',
+            headers={'Authorization':f'Bearer {api_key}','Content-Type':'application/json'},
+            json={'from':sender,'to':[to],'subject':subject,'text':body},
+            timeout=15)
+        if r.status_code>=400:
+            print('EMAIL SEND FAILED:', r.status_code, r.text)
+            return False
         return True
     except Exception as e:
         print('EMAIL SEND FAILED:', str(e))
