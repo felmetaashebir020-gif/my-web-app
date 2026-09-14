@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS signals(id SERIAL PRIMARY KEY,symbol TEXT NOT NULL,di
 CREATE TABLE IF NOT EXISTS mt5_calendar(id SERIAL PRIMARY KEY,time TEXT,currency TEXT,country TEXT,event TEXT,importance INTEGER,actual REAL,forecast REAL,previous REAL,received_at TEXT NOT NULL);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS license_key TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS signals_viewed_count INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
 '''); c.commit(); c.close()
     except Exception as e:
         print('WARNING: could not connect to DATABASE_URL at startup: ' + str(e) +
@@ -84,6 +85,27 @@ def send_email(to,subject,body):
         print('EMAIL SEND FAILED:', str(e))
         return False
 
+def send_telegram(chat_id,text):
+    token=os.getenv('TELEGRAM_BOT_TOKEN','')
+    if not token or not chat_id:
+        return False
+    try:
+        r=requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+            json={'chat_id':chat_id,'text':text}, timeout=15)
+        if r.status_code>=400:
+            print('TELEGRAM SEND FAILED:', r.status_code, r.text)
+            return False
+        return True
+    except Exception as e:
+        print('TELEGRAM SEND FAILED:', str(e))
+        return False
+
+def send_otp_message(to,subject,body,telegram_chat_id=None):
+    if telegram_chat_id:
+        sent=send_telegram(telegram_chat_id, subject+'\n\n'+body)
+        if sent: return True
+    return send_email(to,subject,body)
+
 def admin_email(s,b):
     if os.getenv('ADMIN_EMAIL',''): send_email(os.getenv('ADMIN_EMAIL'),s,b)
 def admin_ok(): return request.headers.get('X-Admin-Key','')==os.getenv('ADMIN_API_KEY','CHANGE_ME')
@@ -94,11 +116,11 @@ def otp(email,purpose):
 def register():
     d=request.get_json(force=True); req=['full_name','email','username','password','mt5_account']
     if any(not str(d.get(k,'')).strip() for k in req): return jsonify(ok=False,error='Missing required field'),400
-    email=d['email'].strip().lower(); c=db(); license_key=secrets.token_hex(16); trial_expiry=(now()+timedelta(days=3)).isoformat()
+    email=d['email'].strip().lower(); c=db(); license_key=secrets.token_hex(16); trial_expiry=(now()+timedelta(days=3)).isoformat(); telegram_chat_id=str(d.get('telegram_chat_id','')).strip() or None
     try:
-        c.execute('INSERT INTO users(full_name,email,phone,username,password_hash,mt5_account,created_at,license_key,membership,membership_expiry) VALUES(?,?,?,?,?,?,?,?,?,?)',(d['full_name'].strip(),email,d.get('phone','').strip(),d['username'].strip(),h(d['password']),str(d['mt5_account']),now().isoformat(),license_key,'FREE',trial_expiry)); c.commit()
+        c.execute('INSERT INTO users(full_name,email,phone,username,password_hash,mt5_account,created_at,license_key,membership,membership_expiry,telegram_chat_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(d['full_name'].strip(),email,d.get('phone','').strip(),d['username'].strip(),h(d['password']),str(d['mt5_account']),now().isoformat(),license_key,'FREE',trial_expiry,telegram_chat_id)); c.commit()
     except psycopg2.IntegrityError: c.close(); return jsonify(ok=False,error='Email or username already exists'),409
-    c.close(); code=otp(email,'REGISTER'); send_email(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.'); admin_email('New GOLD MASTERS registration',f'User: {d["full_name"]}\nEmail: {email}\nMT5: {d["mt5_account"]}\nStatus: PENDING'); return jsonify(ok=True,message='Check email for OTP')
+    c.close(); code=otp(email,'REGISTER'); send_otp_message(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.',telegram_chat_id); admin_email('New GOLD MASTERS registration',f'User: {d["full_name"]}\nEmail: {email}\nMT5: {d["mt5_account"]}\nStatus: PENDING'); return jsonify(ok=True,message='Check your Telegram or email for OTP')
 
 @app.post('/api/verify-email')
 def verify():
@@ -114,7 +136,7 @@ def resend_otp():
     if u['email_verified']: c.close(); return jsonify(ok=False,error='Already verified'),400
     c.close()
     code=otp(email,'REGISTER')
-    sent=send_email(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.')
+    sent=send_otp_message(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.',u.get('telegram_chat_id'))
     return jsonify(ok=True,email_sent=sent)
 
 @app.post('/api/login')
