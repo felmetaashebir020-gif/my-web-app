@@ -58,6 +58,9 @@ CREATE TABLE IF NOT EXISTS otps(id SERIAL PRIMARY KEY,email TEXT NOT NULL,code_h
 CREATE TABLE IF NOT EXISTS payments(id SERIAL PRIMARY KEY,user_id INTEGER NOT NULL,kind TEXT NOT NULL,amount REAL NOT NULL,currency TEXT NOT NULL,method TEXT,reference TEXT,destination TEXT,status TEXT DEFAULT 'PENDING',created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS signals(id SERIAL PRIMARY KEY,symbol TEXT NOT NULL,direction TEXT NOT NULL,entry REAL,sl REAL,tp1 REAL,tp2 REAL,confidence REAL,reason TEXT,created_at TEXT NOT NULL,status TEXT DEFAULT 'ACTIVE');
 CREATE TABLE IF NOT EXISTS mt5_calendar(id SERIAL PRIMARY KEY,time TEXT,currency TEXT,country TEXT,event TEXT,importance INTEGER,actual REAL,forecast REAL,previous REAL,received_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bot_status(mt5_account TEXT PRIMARY KEY,state TEXT,broker TEXT,server TEXT,symbol TEXT,balance REAL,equity REAL,free_margin REAL,spread_points REAL,positions INTEGER,daily_stop INTEGER DEFAULT 0,daily_profit_stop INTEGER DEFAULT 0,drawdown_stop INTEGER DEFAULT 0,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bot_trades(id SERIAL PRIMARY KEY,mt5_account TEXT,event_type TEXT,side TEXT,ticket BIGINT,symbol TEXT,price REAL,lot REAL,sl REAL,tp REAL,profit REAL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bot_control(mt5_account TEXT PRIMARY KEY,enabled INTEGER DEFAULT 1,updated_at TEXT NOT NULL);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS license_key TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS signals_viewed_count INTEGER DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
@@ -109,6 +112,15 @@ def send_otp_message(to,subject,body,telegram_chat_id=None):
 def admin_email(s,b):
     if os.getenv('ADMIN_EMAIL',''): send_email(os.getenv('ADMIN_EMAIL'),s,b)
 def admin_ok(): return request.headers.get('X-Admin-Key','')==os.getenv('ADMIN_API_KEY','CHANGE_ME')
+
+# --- MT5 EA integration auth helpers ---
+def website_api_ok():
+    auth=request.headers.get('Authorization','')
+    token=auth.replace('Bearer ','').strip() if auth.startswith('Bearer ') else auth.strip()
+    return token!='' and token==os.getenv('WEBSITE_API_KEY','CHANGE_ME')
+def bot_control_ok():
+    return request.headers.get('X-Bot-Control-Key','')==os.getenv('BOT_CONTROL_KEY','CHANGE_ME')
+
 def otp(email,purpose):
     code=f'{secrets.randbelow(1000000):06d}'; c=db(); c.execute('UPDATE otps SET used=1 WHERE email=? AND purpose=? AND used=0',(email,purpose)); c.execute('INSERT INTO otps(email,code_hash,expires_at,purpose) VALUES(?,?,?,?)',(email,h(code),(now()+timedelta(minutes=OTP_MINUTES)).isoformat(),purpose)); c.commit(); c.close(); return code
 
@@ -260,6 +272,87 @@ def calendar_mt5():
                    float(e.get('previous',0) or 0),now().isoformat()))
     c.commit(); c.close()
     return jsonify(ok=True,provider='MT5 Built-in Economic Calendar',count=min(len(events),500))
+
+# ============================================================
+# MT5 EA INTEGRATION: heartbeat, trade log, remote bot control
+# These are the endpoints ROBOT_AI_AUTO_TRADING_BOT-14.mq5 calls
+# when UseWebsiteAPI / UseRemoteBotControl are enabled in its inputs.
+# ============================================================
+
+@app.post('/api/mt5/heartbeat')
+def mt5_heartbeat():
+    if not website_api_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True) or {}
+    account=str(d.get('mt5_account','')).strip()
+    if not account: return jsonify(ok=False,error='Missing mt5_account'),400
+    c=db()
+    u=c.execute('SELECT * FROM users WHERE mt5_account=?',(account,)).fetchone()
+    c.execute('''INSERT INTO bot_status(mt5_account,state,broker,server,symbol,balance,equity,free_margin,spread_points,positions,daily_stop,daily_profit_stop,drawdown_stop,updated_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 ON CONFLICT(mt5_account) DO UPDATE SET state=EXCLUDED.state,broker=EXCLUDED.broker,server=EXCLUDED.server,symbol=EXCLUDED.symbol,
+                   balance=EXCLUDED.balance,equity=EXCLUDED.equity,free_margin=EXCLUDED.free_margin,spread_points=EXCLUDED.spread_points,
+                   positions=EXCLUDED.positions,daily_stop=EXCLUDED.daily_stop,daily_profit_stop=EXCLUDED.daily_profit_stop,
+                   drawdown_stop=EXCLUDED.drawdown_stop,updated_at=EXCLUDED.updated_at''',
+              (account,d.get('state',''),d.get('broker',''),d.get('server',''),d.get('symbol',''),
+               float(d.get('balance',0) or 0),float(d.get('equity',0) or 0),float(d.get('free_margin',0) or 0),
+               float(d.get('spread_points',0) or 0),int(d.get('positions',0) or 0),
+               1 if d.get('daily_stop') else 0,1 if d.get('daily_profit_stop') else 0,1 if d.get('drawdown_stop') else 0,
+               now().isoformat()))
+    c.commit(); c.close()
+    # license flag the EA checks inside the heartbeat response ("license":true/false)
+    license_ok=True
+    if u:
+        license_ok = (u['status']=='APPROVED' and u['email_verified']==1)
+        if u['membership']!='LIFETIME' and u['membership_expiry']:
+            try:
+                if datetime.fromisoformat(u['membership_expiry'])<now(): license_ok=False
+            except ValueError: pass
+    return jsonify(ok=True,license=license_ok)
+
+@app.post('/api/mt5/trade')
+def mt5_trade():
+    if not website_api_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True) or {}
+    c=db()
+    c.execute('INSERT INTO bot_trades(mt5_account,event_type,side,ticket,symbol,price,lot,sl,tp,profit,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+              (str(d.get('mt5_account','')).strip(),str(d.get('type','')),str(d.get('side','')),
+               int(d.get('ticket',0) or 0),str(d.get('symbol','')),float(d.get('price',0) or 0),
+               float(d.get('lot',0) or 0),float(d.get('sl',0) or 0),float(d.get('tp',0) or 0),
+               float(d.get('profit',0) or 0),now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True)
+
+@app.get('/api/mt5/bot-control')
+def mt5_bot_control():
+    if not bot_control_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    account=request.args.get('account','').strip()
+    c=db()
+    row=c.execute('SELECT enabled FROM bot_control WHERE mt5_account=?',(account,)).fetchone() if account else None
+    c.close()
+    enabled = bool(row['enabled']) if row else True  # default ON if no explicit record
+    return jsonify(ok=True,enabled=enabled)
+
+@app.get('/api/admin/mt5-status')
+def admin_mt5_status():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    return jsonify(ok=True,bots=rows('SELECT * FROM bot_status ORDER BY updated_at DESC'))
+
+@app.get('/api/admin/mt5-trades')
+def admin_mt5_trades():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    return jsonify(ok=True,trades=rows('SELECT * FROM bot_trades ORDER BY id DESC LIMIT 200'))
+
+@app.post('/api/admin/bot-control')
+def admin_bot_control():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True); account=str(d.get('mt5_account','')).strip(); enabled=1 if d.get('enabled',True) else 0
+    if not account: return jsonify(ok=False,error='Missing mt5_account'),400
+    c=db()
+    c.execute('''INSERT INTO bot_control(mt5_account,enabled,updated_at) VALUES(?,?,?)
+                 ON CONFLICT(mt5_account) DO UPDATE SET enabled=EXCLUDED.enabled,updated_at=EXCLUDED.updated_at''',
+              (account,enabled,now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True,mt5_account=account,enabled=bool(enabled))
 
 @app.get('/api/admin/users')
 def admin_users():
