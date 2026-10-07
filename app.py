@@ -88,19 +88,38 @@ def send_email(to,subject,body):
         print('EMAIL SEND FAILED:', str(e))
         return False
 
+TG_ERR=['']
+def tg_error():
+    return TG_ERR[0] or 'Could not send the Telegram code. Please check your Telegram Chat ID.'
+
 def send_telegram(chat_id,text):
-    token=os.getenv('TELEGRAM_BOT_TOKEN','')
-    if not token or not chat_id:
-        return False
+    TG_ERR[0]=''
+    token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+    if not token:
+        TG_ERR[0]='Server problem: TELEGRAM_BOT_TOKEN is missing on Render (Environment settings).'
+        print('TELEGRAM SEND FAILED: TELEGRAM_BOT_TOKEN missing'); return False
+    if not chat_id:
+        TG_ERR[0]='Telegram Chat ID is empty.'; return False
     try:
         r=requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
-            json={'chat_id':chat_id,'text':text}, timeout=15)
+            json={'chat_id':str(chat_id).strip(),'text':text}, timeout=15)
         if r.status_code>=400:
             print('TELEGRAM SEND FAILED:', r.status_code, r.text)
+            try: desc=r.json().get('description','')
+            except Exception: desc=''
+            if r.status_code==401:
+                TG_ERR[0]='Server problem: the bot token on Render is wrong (Unauthorized). Update TELEGRAM_BOT_TOKEN.'
+            elif r.status_code==403:
+                TG_ERR[0]='Telegram blocked it ('+desc+'). Open the bot in Telegram and press Start, then try again.'
+            elif 'chat not found' in desc.lower():
+                TG_ERR[0]='Telegram says: chat not found. Check your Chat ID (numbers only, from @userinfobot) and press Start on the bot.'
+            else:
+                TG_ERR[0]='Telegram error '+str(r.status_code)+': '+desc
             return False
         return True
     except Exception as e:
         print('TELEGRAM SEND FAILED:', str(e))
+        TG_ERR[0]='Could not reach Telegram from the server: '+str(e)
         return False
 
 def send_otp_message(to,subject,body,telegram_chat_id=None):
@@ -131,9 +150,15 @@ def register():
     email=d['email'].strip().lower(); c=db(); license_key=secrets.token_hex(16); trial_expiry=(now()+timedelta(days=3)).isoformat(); telegram_chat_id=str(d.get('telegram_chat_id','')).strip()
     try:
         c.execute('INSERT INTO users(full_name,email,phone,username,password_hash,mt5_account,created_at,license_key,membership,membership_expiry,telegram_chat_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(d['full_name'].strip(),email,d.get('phone','').strip(),d['username'].strip(),h(d['password']),str(d['mt5_account']),now().isoformat(),license_key,'FREE',trial_expiry,telegram_chat_id)); c.commit()
-    except psycopg2.IntegrityError: c.close(); return jsonify(ok=False,error='Email or username already exists'),409
+    except psycopg2.IntegrityError:
+        c.close(); c=db()
+        ex=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
+        if not ex or ex.get('email_verified') or ex.get('username')!=d['username'].strip():
+            c.close(); return jsonify(ok=False,error='Email or username already exists'),409
+        # Earlier attempt failed before the code was delivered: let the user retry with updated details.
+        c.execute('UPDATE users SET full_name=?,phone=?,password_hash=?,mt5_account=?,telegram_chat_id=? WHERE email=?',(d['full_name'].strip(),d.get('phone','').strip(),h(d['password']),str(d['mt5_account']),telegram_chat_id,email)); c.commit()
     c.close(); code=otp(email,'REGISTER'); sent=send_otp_message(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.',telegram_chat_id); admin_email('New GOLD MASTERS registration',f'User: {d["full_name"]}\nEmail: {email}\nMT5: {d["mt5_account"]}\nStatus: PENDING')
-    if not sent: return jsonify(ok=False,error='Could not send Telegram OTP. Double-check your Telegram Chat ID.'),502
+    if not sent: return jsonify(ok=False,error=tg_error()),502
     return jsonify(ok=True,message='Check your Telegram for the verification code')
 
 @app.post('/api/verify-email')
@@ -151,7 +176,7 @@ def resend_otp():
     c.close()
     code=otp(email,'REGISTER')
     sent=send_otp_message(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.',u.get('telegram_chat_id'))
-    if not sent: return jsonify(ok=False,error='Could not send Telegram OTP. Double-check your Telegram Chat ID.'),502
+    if not sent: return jsonify(ok=False,error=tg_error()),502
     return jsonify(ok=True,email_sent=sent)
 
 @app.post('/api/login')
