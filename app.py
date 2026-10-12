@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS bot_control(mt5_account TEXT PRIMARY KEY,enabled INTE
 ALTER TABLE users ADD COLUMN IF NOT EXISTS license_key TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS signals_viewed_count INTEGER DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
+ALTER TABLE bot_status ADD COLUMN IF NOT EXISTS version TEXT;
 '''); c.commit(); c.close()
     except Exception as e:
         print('WARNING: could not connect to DATABASE_URL at startup: ' + str(e) +
@@ -385,7 +386,7 @@ def admin_bot_control():
 @app.get('/api/admin/users')
 def admin_users():
     if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
-    return jsonify(ok=True,users=rows('SELECT id,full_name,email,username,mt5_account,email_verified,status,membership,membership_expiry,created_at,last_login,wallet_balance,license_key FROM users ORDER BY id DESC'))
+    return jsonify(ok=True,users=rows('SELECT u.id,u.full_name,u.email,u.username,u.mt5_account,u.email_verified,u.status,u.membership,u.membership_expiry,u.created_at,u.last_login,u.wallet_balance,u.license_key,s.state AS bot_state,s.equity AS bot_equity,s.balance AS bot_balance,s.positions AS bot_positions,s.updated_at AS bot_seen,s.version AS bot_version,COALESCE(c.enabled,1) AS bot_enabled FROM users u LEFT JOIN bot_status s ON s.mt5_account=u.mt5_account LEFT JOIN bot_control c ON c.mt5_account=u.mt5_account ORDER BY u.id DESC'))
 
 @app.get('/api/admin/payments')
 def admin_payments():
@@ -445,8 +446,11 @@ def admin_mt5_account():
 def mt5_verify():
     account=request.args.get('account','').strip(); key=request.args.get('key','').strip()
     if not account or not key: return jsonify(ok=False,error='Missing account or key'),400
-    c=db(); u=c.execute('SELECT * FROM users WHERE mt5_account=? AND license_key=?',(account,key)).fetchone(); c.close()
+    c=db(); u=c.execute('SELECT * FROM users WHERE mt5_account=? AND license_key=?',(account,key)).fetchone()
+    ctl=c.execute('SELECT enabled FROM bot_control WHERE mt5_account=?',(account,)).fetchone() if u else None
+    c.close()
     if not u: return jsonify(ok=False,error='Invalid account or license key'),401
+    enabled=bool(ctl['enabled']) if ctl else True   # admin can pause one customer's EA; default ON
     active=(u['status']=='APPROVED' and u['email_verified']==1)
     expired=False
     if u['membership']!='LIFETIME' and u['membership_expiry']:
@@ -456,7 +460,54 @@ def mt5_verify():
     if expired: active=False
     auto_allowed=active and u['membership'] in ('YEARLY','LIFETIME')
     return jsonify(ok=True,active=active,expired=expired,status=u['status'],membership=u['membership'],
-                   membership_expiry=u['membership_expiry'],wallet_balance=u['wallet_balance'],auto_allowed=auto_allowed)
+                   membership_expiry=u['membership_expiry'],wallet_balance=u['wallet_balance'],auto_allowed=auto_allowed,enabled=enabled,
+                   latest_version=os.getenv('EA_LATEST_VERSION','').strip(),download_url=os.getenv('EA_DOWNLOAD_URL','').strip())
+
+
+# ---- EA <-> website link: every call is authenticated with the customer's own MT5 account + license key ----
+def ea_auth(d):
+    account=str(d.get('account','')).strip(); key=str(d.get('key','')).strip()
+    if not account or not key: return None
+    c=db(); u=c.execute('SELECT * FROM users WHERE mt5_account=? AND license_key=?',(account,key)).fetchone(); c.close()
+    return u
+
+@app.post('/api/ea/report')
+def ea_report():
+    d=request.get_json(force=True,silent=True) or {}
+    u=ea_auth(d)
+    if not u: return jsonify(ok=False,error='Invalid account or license key'),401
+    account=str(d.get('account')).strip()
+    def num(k): 
+        try: return float(d.get(k,0) or 0)
+        except (TypeError,ValueError): return 0.0
+    c=db()
+    c.execute('''INSERT INTO bot_status(mt5_account,state,broker,server,symbol,balance,equity,free_margin,spread_points,positions,daily_stop,daily_profit_stop,drawdown_stop,updated_at,version)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 ON CONFLICT(mt5_account) DO UPDATE SET state=EXCLUDED.state,broker=EXCLUDED.broker,server=EXCLUDED.server,symbol=EXCLUDED.symbol,
+                   balance=EXCLUDED.balance,equity=EXCLUDED.equity,free_margin=EXCLUDED.free_margin,spread_points=EXCLUDED.spread_points,
+                   positions=EXCLUDED.positions,daily_stop=EXCLUDED.daily_stop,daily_profit_stop=EXCLUDED.daily_profit_stop,
+                   drawdown_stop=EXCLUDED.drawdown_stop,updated_at=EXCLUDED.updated_at,version=EXCLUDED.version''',
+              (account,str(d.get('state',''))[:80],str(d.get('broker',''))[:80],str(d.get('server',''))[:80],str(d.get('symbol',''))[:30],
+               num('balance'),num('equity'),num('free_margin'),num('spread_points'),int(num('positions')),
+               1 if d.get('daily_stop') else 0,0,0,now().isoformat(),str(d.get('version',''))[:20]))
+    ctl=c.execute('SELECT enabled FROM bot_control WHERE mt5_account=?',(account,)).fetchone()
+    c.commit(); c.close()
+    return jsonify(ok=True,enabled=(bool(ctl['enabled']) if ctl else True))
+
+@app.post('/api/ea/trade')
+def ea_trade():
+    d=request.get_json(force=True,silent=True) or {}
+    u=ea_auth(d)
+    if not u: return jsonify(ok=False,error='Invalid account or license key'),401
+    def num(k):
+        try: return float(d.get(k,0) or 0)
+        except (TypeError,ValueError): return 0.0
+    c=db()
+    c.execute('INSERT INTO bot_trades(mt5_account,event_type,side,ticket,symbol,price,lot,sl,tp,profit,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+              (str(d.get('account')).strip(),str(d.get('type',''))[:30],str(d.get('side',''))[:10],int(num('ticket')),
+               str(d.get('symbol',''))[:30],num('price'),num('lot'),num('sl'),num('tp'),num('profit'),now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True)
 
 @app.get('/api/health')
 def health(): return jsonify(ok=True,service='GOLD MASTERS API',time=now().isoformat())
