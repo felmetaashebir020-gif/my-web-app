@@ -65,6 +65,9 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS license_key TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS signals_viewed_count INTEGER DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
 ALTER TABLE bot_status ADD COLUMN IF NOT EXISTS version TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS tp3 REAL;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS bar_time TEXT;
 '''); c.commit(); c.close()
     except Exception as e:
         print('WARNING: could not connect to DATABASE_URL at startup: ' + str(e) +
@@ -131,15 +134,29 @@ def send_otp_message(to,subject,body,telegram_chat_id=None):
 
 def admin_email(s,b):
     if os.getenv('ADMIN_EMAIL',''): send_email(os.getenv('ADMIN_EMAIL'),s,b)
-def admin_ok(): return request.headers.get('X-Admin-Key','')==os.getenv('ADMIN_API_KEY','CHANGE_ME')
+def key_ok(given,*env_names):
+    # A key is accepted only if the server has a real value for it. Unset or 'CHANGE_ME' never matches.
+    given=(given or '').strip()
+    if not given: return False
+    for n in env_names:
+        expected=os.getenv(n,'').strip()
+        if expected and expected!='CHANGE_ME' and secrets.compare_digest(given.encode(),expected.encode()):
+            return True
+    return False
+def admin_ok(): return key_ok(request.headers.get('X-Admin-Key',''),'ADMIN_API_KEY')
 
 # --- MT5 EA integration auth helpers ---
 def website_api_ok():
     auth=request.headers.get('Authorization','')
     token=auth.replace('Bearer ','').strip() if auth.startswith('Bearer ') else auth.strip()
-    return token!='' and token==os.getenv('WEBSITE_API_KEY','CHANGE_ME')
+    return key_ok(token,'WEBSITE_API_KEY')
+def signal_api_ok():
+    # GOLD TITAN publishing: SIGNAL_API_KEY if you set one, otherwise WEBSITE_API_KEY.
+    auth=request.headers.get('Authorization','')
+    token=auth[7:].strip() if auth.startswith('Bearer ') else auth.strip()
+    return key_ok(token,'SIGNAL_API_KEY','WEBSITE_API_KEY')
 def bot_control_ok():
-    return request.headers.get('X-Bot-Control-Key','')==os.getenv('BOT_CONTROL_KEY','CHANGE_ME')
+    return key_ok(request.headers.get('X-Bot-Control-Key',''),'BOT_CONTROL_KEY')
 
 def otp(email,purpose):
     code=f'{secrets.randbelow(1000000):06d}'; c=db(); c.execute('UPDATE otps SET used=1 WHERE email=? AND purpose=? AND used=0',(email,purpose)); c.execute('INSERT INTO otps(email,code_hash,expires_at,purpose) VALUES(?,?,?,?)',(email,h(code),(now()+timedelta(minutes=OTP_MINUTES)).isoformat(),purpose)); c.commit(); c.close(); return code
@@ -203,6 +220,9 @@ def pricing(): return jsonify(ok=True,pricing=PRICING,trial='3 days or 3 signals
 @app.get('/api/signals')
 def signals():
     email=request.args.get('email','').strip().lower()
+    try:
+        c0=db(); c0.execute("UPDATE signals SET status='EXPIRED' WHERE status='ACTIVE' AND created_at<?",((now()-timedelta(hours=24)).isoformat(),)); c0.commit(); c0.close()
+    except Exception as e: print('signal expiry skipped:',e)
     all_signals=rows("SELECT * FROM signals WHERE status='ACTIVE' ORDER BY id DESC LIMIT 100")
     if not email:
         return jsonify(ok=True,signals=[],trial=True,error='Login required to view signals. Free trial: 3 days or 3 signals.',pricing=PRICING)
@@ -285,8 +305,7 @@ def calendar():
 
 @app.post('/api/calendar/mt5')
 def calendar_mt5():
-    key=os.getenv('MT5_CALENDAR_PUSH_KEY','CHANGE_ME')
-    if request.headers.get('X-Calendar-Key','') != key:
+    if not key_ok(request.headers.get('X-Calendar-Key',''),'MT5_CALENDAR_PUSH_KEY'):
         return jsonify(ok=False,error='Unauthorized'),401
     d=request.get_json(force=True) or {}
     events=d.get('events',[])
@@ -374,6 +393,40 @@ def mt5_signal():
     c.execute("UPDATE signals SET status='REPLACED' WHERE symbol=? AND status='ACTIVE'",(symbol,))
     c.execute('INSERT INTO signals(symbol,direction,entry,sl,tp1,tp2,confidence,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
               (symbol,direction,num('entry'),num('sl'),num('tp1'),num('tp2'),num('confidence'),reason,now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True)
+
+@app.post('/api/ea/signal')
+def ea_signal():
+    # GOLD TITAN AI (OWNER build) publishes full-confirmation BUY/SELL signals here.
+    # Auth: "Authorization: Bearer <SIGNAL_API_KEY or WEBSITE_API_KEY>".
+    if not signal_api_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True,silent=True) or {}
+    direction=str(d.get('direction','')).strip().upper()
+    if direction not in ('BUY','SELL'): return jsonify(ok=False,error='direction must be BUY or SELL'),400
+    symbol=str(d.get('symbol','')).strip().upper()[:30]
+    if not symbol: return jsonify(ok=False,error='symbol required'),400
+    timeframe=str(d.get('timeframe','')).strip().upper()[:10]
+    def num(k):
+        try:
+            v=float(d.get(k))
+            return v if v>0 and v==v and v<1e9 else None
+        except (TypeError,ValueError): return None
+    entry,sl,tp1,tp2,tp3=num('entry'),num('sl'),num('tp1'),num('tp2'),num('tp3')
+    if None in (entry,sl,tp1,tp2,tp3): return jsonify(ok=False,error='entry, sl, tp1, tp2, tp3 must be positive numbers'),400
+    if direction=='BUY' and not (sl<entry<tp1<tp2<tp3): return jsonify(ok=False,error='BUY needs sl < entry < tp1 < tp2 < tp3'),400
+    if direction=='SELL' and not (sl>entry>tp1>tp2>tp3): return jsonify(ok=False,error='SELL needs sl > entry > tp1 > tp2 > tp3'),400
+    try: score=float(d.get('confidence')) if d.get('confidence') not in (None,'') else None
+    except (TypeError,ValueError): score=None
+    reason=str(d.get('reason',''))[:300]
+    bar_time=str(d.get('bar_time','')).strip()[:20]
+    c=db()
+    if bar_time:
+        dup=c.execute("SELECT id FROM signals WHERE symbol=? AND timeframe=? AND direction=? AND bar_time=? LIMIT 1",(symbol,timeframe,direction,bar_time)).fetchone()
+        if dup: c.close(); return jsonify(ok=True,duplicate=True)
+    c.execute("UPDATE signals SET status='REPLACED' WHERE symbol=? AND status='ACTIVE'",(symbol,))
+    c.execute('INSERT INTO signals(symbol,direction,entry,sl,tp1,tp2,tp3,confidence,reason,timeframe,bar_time,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+              (symbol,direction,entry,sl,tp1,tp2,tp3,score,reason,timeframe,bar_time,now().isoformat()))
     c.commit(); c.close()
     return jsonify(ok=True)
 
