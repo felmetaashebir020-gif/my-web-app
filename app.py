@@ -351,6 +351,32 @@ def mt5_trade():
     c.commit(); c.close()
     return jsonify(ok=True)
 
+@app.post('/api/mt5/signal')
+def mt5_signal():
+    # GOLD TITAN AI EA pushes its BUY/SELL signals here; they appear in the website Signals tab.
+    if not website_api_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True) or {}
+    account=str(d.get('mt5_account','')).strip()
+    publisher=os.getenv('SIGNAL_PUBLISHER_ACCOUNT','').strip()
+    if publisher and account!=publisher: return jsonify(ok=False,error='This MT5 account is not allowed to publish signals'),403
+    direction=str(d.get('direction','')).upper()
+    if direction not in ('BUY','SELL'): return jsonify(ok=False,error='direction must be BUY or SELL'),400
+    symbol=str(d.get('symbol','XAUUSD')).upper()
+    def num(k):
+        try: return float(d.get(k)) if d.get(k) not in (None,'') else None
+        except (TypeError,ValueError): return None
+    reason=str(d.get('reason',''))[:300]
+    if num('tp3') is not None: reason=(reason+' | TP3: '+str(num('tp3'))).strip(' |')
+    c=db()
+    since=(now()-timedelta(minutes=30)).isoformat()
+    dup=c.execute("SELECT id FROM signals WHERE symbol=? AND direction=? AND created_at>? AND status='ACTIVE' LIMIT 1",(symbol,direction,since)).fetchone()
+    if dup: c.close(); return jsonify(ok=True,duplicate=True)
+    c.execute("UPDATE signals SET status='REPLACED' WHERE symbol=? AND status='ACTIVE'",(symbol,))
+    c.execute('INSERT INTO signals(symbol,direction,entry,sl,tp1,tp2,confidence,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
+              (symbol,direction,num('entry'),num('sl'),num('tp1'),num('tp2'),num('confidence'),reason,now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True)
+
 @app.get('/api/mt5/bot-control')
 def mt5_bot_control():
     if not bot_control_ok(): return jsonify(ok=False,error='Unauthorized'),401
