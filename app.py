@@ -1,6 +1,6 @@
 import os, secrets, hashlib, smtplib, requests
 import psycopg2, psycopg2.extras
-import socket
+import socket, time
 
 # --- Force IPv4 for outbound connections (fixes "Network is unreachable" on Render) ---
 _orig_getaddrinfo = socket.getaddrinfo
@@ -67,18 +67,26 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
 ALTER TABLE bot_status ADD COLUMN IF NOT EXISTS version TEXT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS tp3 REAL;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe TEXT;
-ALTER TABLE signals ADD COLUMN IF NOT EXISTS bar_time TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_dedupe ON signals(dedupe_key);
 '''); c.commit(); c.close()
     except Exception as e:
         print('WARNING: could not connect to DATABASE_URL at startup: ' + str(e) +
               '. The app will still start, but database operations will fail until this is fixed. '
               'Check /api/admin/db-check once deployed.')
 
+EMAIL_ERR=['']
+def email_error():
+    return EMAIL_ERR[0] or 'Could not send the verification email.'
+
 def send_email(to,subject,body):
-    api_key=os.getenv('RESEND_API_KEY','')
-    sender=os.getenv('SMTP_FROM','onboarding@resend.dev')
+    EMAIL_ERR[0]=''
+    api_key=os.getenv('RESEND_API_KEY','').strip()
+    sender=os.getenv('SMTP_FROM','onboarding@resend.dev').strip()
     if not api_key:
-        print('EMAIL NOT CONFIGURED',subject,to); return False
+        print('EMAIL NOT CONFIGURED',subject,to)
+        EMAIL_ERR[0]='Email service is not configured on the server (RESEND_API_KEY missing).'
+        return False
     try:
         r=requests.post('https://api.resend.com/emails',
             headers={'Authorization':f'Bearer {api_key}','Content-Type':'application/json'},
@@ -86,10 +94,20 @@ def send_email(to,subject,body):
             timeout=15)
         if r.status_code>=400:
             print('EMAIL SEND FAILED:', r.status_code, r.text)
+            try: msg=str(r.json().get('message',''))
+            except Exception: msg=''
+            low=msg.lower()
+            if 'verify a domain' in low or 'testing emails' in low or 'domain is not verified' in low:
+                EMAIL_ERR[0]='Server problem: the sending email domain is not verified yet (Resend). Please contact support.'
+            elif r.status_code in (401,403) and 'api key' in low:
+                EMAIL_ERR[0]='Server problem: the email API key is wrong (Resend).'
+            else:
+                EMAIL_ERR[0]='Email error '+str(r.status_code)+': '+msg[:150]
             return False
         return True
     except Exception as e:
         print('EMAIL SEND FAILED:', str(e))
+        EMAIL_ERR[0]='Could not reach the email service: '+str(e)[:120]
         return False
 
 TG_ERR=['']
@@ -126,45 +144,71 @@ def send_telegram(chat_id,text):
         TG_ERR[0]='Could not reach Telegram from the server: '+str(e)
         return False
 
+def otp_mode():
+    # telegram (default, current behaviour) | email | both
+    m=os.getenv('OTP_MODE','telegram').strip().lower()
+    # none = no OTP at all: the account is created verified and waits for admin approval
+    return m if m in ('telegram','email','both','none') else 'telegram'
+
+RATE={}
+def rate_ok(key,limit,window):
+    t=time.time()
+    xs=[x for x in RATE.get(key,[]) if t-x<window]
+    if len(xs)>=limit:
+        RATE[key]=xs
+        return False
+    xs.append(t); RATE[key]=xs
+    if len(RATE)>5000: RATE.clear()
+    return True
+
+def client_ip():
+    return (request.headers.get('X-Forwarded-For','').split(',')[0].strip() or request.remote_addr or '?')
+
+
 def send_otp_message(to,subject,body,telegram_chat_id=None):
-    # OTP is Telegram-only. No email fallback.
+    mode=otp_mode()
+    if mode=='email':
+        return send_email(to,subject,body)
+    if mode=='both':
+        e=send_email(to,subject,body)
+        t=send_telegram(telegram_chat_id,subject+'\n\n'+body) if telegram_chat_id else False
+        return e or t
     if not telegram_chat_id:
+        TG_ERR[0]='Telegram Chat ID is required.'
         return False
     return send_telegram(telegram_chat_id, subject+'\n\n'+body)
 
+def otp_error():
+    return email_error() if otp_mode() in ('email','both') else tg_error()
+
+def otp_sent_message():
+    return {'email':'Check your email (also the spam folder) for the verification code',
+            'both':'Check your email and Telegram for the verification code'}.get(otp_mode(),'Check your Telegram for the verification code')
+
+@app.get('/api/otp-mode')
+def api_otp_mode():
+    return jsonify(ok=True,mode=otp_mode())
+
 def admin_email(s,b):
     if os.getenv('ADMIN_EMAIL',''): send_email(os.getenv('ADMIN_EMAIL'),s,b)
-def key_ok(given,*env_names):
-    # A key is accepted only if the server has a real value for it. Unset or 'CHANGE_ME' never matches.
-    given=(given or '').strip()
-    if not given: return False
-    for n in env_names:
-        expected=os.getenv(n,'').strip()
-        if expected and expected!='CHANGE_ME' and secrets.compare_digest(given.encode(),expected.encode()):
-            return True
-    return False
-def admin_ok(): return key_ok(request.headers.get('X-Admin-Key',''),'ADMIN_API_KEY')
+def admin_ok(): return request.headers.get('X-Admin-Key','')==os.getenv('ADMIN_API_KEY','CHANGE_ME')
 
 # --- MT5 EA integration auth helpers ---
 def website_api_ok():
     auth=request.headers.get('Authorization','')
     token=auth.replace('Bearer ','').strip() if auth.startswith('Bearer ') else auth.strip()
-    return key_ok(token,'WEBSITE_API_KEY')
-def signal_api_ok():
-    # GOLD TITAN publishing: SIGNAL_API_KEY if you set one, otherwise WEBSITE_API_KEY.
-    auth=request.headers.get('Authorization','')
-    token=auth[7:].strip() if auth.startswith('Bearer ') else auth.strip()
-    return key_ok(token,'SIGNAL_API_KEY','WEBSITE_API_KEY')
+    return token!='' and token==os.getenv('WEBSITE_API_KEY','CHANGE_ME')
 def bot_control_ok():
-    return key_ok(request.headers.get('X-Bot-Control-Key',''),'BOT_CONTROL_KEY')
+    return request.headers.get('X-Bot-Control-Key','')==os.getenv('BOT_CONTROL_KEY','CHANGE_ME')
 
 def otp(email,purpose):
     code=f'{secrets.randbelow(1000000):06d}'; c=db(); c.execute('UPDATE otps SET used=1 WHERE email=? AND purpose=? AND used=0',(email,purpose)); c.execute('INSERT INTO otps(email,code_hash,expires_at,purpose) VALUES(?,?,?,?)',(email,h(code),(now()+timedelta(minutes=OTP_MINUTES)).isoformat(),purpose)); c.commit(); c.close(); return code
 
 @app.post('/api/register')
 def register():
-    d=request.get_json(force=True); req=['full_name','email','username','password','mt5_account','telegram_chat_id']
-    if any(not str(d.get(k,'')).strip() for k in req): return jsonify(ok=False,error='Missing required field (Telegram Chat ID is required)'),400
+    if not rate_ok('reg:'+client_ip(),20,3600): return jsonify(ok=False,error='Too many attempts. Please try again later.'),429
+    d=request.get_json(force=True); req=['full_name','email','username','password','mt5_account']+(['telegram_chat_id'] if otp_mode()=='telegram' else [])
+    if any(not str(d.get(k,'')).strip() for k in req): return jsonify(ok=False,error='Missing required field'+(' (Telegram Chat ID is required)' if otp_mode()=='telegram' else '')),400
     email=d['email'].strip().lower(); c=db(); license_key=secrets.token_hex(16); trial_expiry=(now()+timedelta(days=3)).isoformat(); telegram_chat_id=str(d.get('telegram_chat_id','')).strip()
     try:
         c.execute('INSERT INTO users(full_name,email,phone,username,password_hash,mt5_account,created_at,license_key,membership,membership_expiry,telegram_chat_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(d['full_name'].strip(),email,d.get('phone','').strip(),d['username'].strip(),h(d['password']),str(d['mt5_account']),now().isoformat(),license_key,'FREE',trial_expiry,telegram_chat_id)); c.commit()
@@ -175,30 +219,38 @@ def register():
             c.close(); return jsonify(ok=False,error='Email or username already exists'),409
         # Earlier attempt failed before the code was delivered: let the user retry with updated details.
         c.execute('UPDATE users SET full_name=?,phone=?,password_hash=?,mt5_account=?,telegram_chat_id=? WHERE email=?',(d['full_name'].strip(),d.get('phone','').strip(),h(d['password']),str(d['mt5_account']),telegram_chat_id,email)); c.commit()
+    if otp_mode()=='none':
+        c.execute('UPDATE users SET email_verified=1 WHERE email=?',(email,)); c.commit(); c.close()
+        admin_email('New GOLD MASTERS registration (awaiting your approval)',f'User: {d["full_name"]}\nEmail: {email}\nMT5: {d["mt5_account"]}\nStatus: PENDING')
+        return jsonify(ok=True,message='Registered. Your account is waiting for admin approval. You can log in after it is approved.')
     c.close(); code=otp(email,'REGISTER'); sent=send_otp_message(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.',telegram_chat_id); admin_email('New GOLD MASTERS registration',f'User: {d["full_name"]}\nEmail: {email}\nMT5: {d["mt5_account"]}\nStatus: PENDING')
-    if not sent: return jsonify(ok=False,error=tg_error()),502
-    return jsonify(ok=True,message='Check your Telegram for the verification code')
+    if not sent: return jsonify(ok=False,error=otp_error()),502
+    return jsonify(ok=True,message=otp_sent_message())
 
 @app.post('/api/verify-email')
 def verify():
+    if otp_mode()=='none': return jsonify(ok=False,error='Verification is not required. Wait for admin approval.'),400
     d=request.get_json(force=True); email=d.get('email','').strip().lower(); code=d.get('code','').strip(); c=db(); r=c.execute("SELECT * FROM otps WHERE email=? AND purpose='REGISTER' AND used=0 ORDER BY id DESC LIMIT 1",(email,)).fetchone()
     if not r or r['expires_at']<now().isoformat() or r['code_hash']!=h(code): c.close(); return jsonify(ok=False,error='Invalid or expired code'),400
     c.execute('UPDATE otps SET used=1 WHERE id=?',(r['id'],)); c.execute('UPDATE users SET email_verified=1 WHERE email=?',(email,)); c.commit(); c.close(); admin_email('Email verified',f'{email} verified email and awaits admin approval.'); return jsonify(ok=True,status='PENDING')
 
 @app.post('/api/resend-otp')
 def resend_otp():
+    if otp_mode()=='none': return jsonify(ok=False,error='Verification is not required.'),400
     d=request.get_json(force=True); email=d.get('email','').strip().lower()
+    if not rate_ok('rs:'+email,5,3600) or not rate_ok('rsip:'+client_ip(),30,3600): return jsonify(ok=False,error='Too many attempts. Please try again later.'),429
     c=db(); u=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
     if not u: c.close(); return jsonify(ok=False,error='User not found'),404
     if u['email_verified']: c.close(); return jsonify(ok=False,error='Already verified'),400
     c.close()
     code=otp(email,'REGISTER')
     sent=send_otp_message(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.',u.get('telegram_chat_id'))
-    if not sent: return jsonify(ok=False,error=tg_error()),502
+    if not sent: return jsonify(ok=False,error=otp_error()),502
     return jsonify(ok=True,email_sent=sent)
 
 @app.post('/api/login')
 def login():
+    if not rate_ok('login:'+client_ip(),60,600): return jsonify(ok=False,error='Too many attempts. Please try again later.'),429
     d=request.get_json(force=True); ident=d.get('username_or_email','').strip(); pw=d.get('password',''); c=db(); u=c.execute('SELECT * FROM users WHERE username=? OR email=?',(ident,ident.lower())).fetchone()
     if not u or u['password_hash']!=h(pw): c.close(); return jsonify(ok=False,error='Invalid login'),401
     if not u['email_verified']: c.close(); return jsonify(ok=False,error='Email not verified'),403
@@ -220,9 +272,6 @@ def pricing(): return jsonify(ok=True,pricing=PRICING,trial='3 days or 3 signals
 @app.get('/api/signals')
 def signals():
     email=request.args.get('email','').strip().lower()
-    try:
-        c0=db(); c0.execute("UPDATE signals SET status='EXPIRED' WHERE status='ACTIVE' AND created_at<?",((now()-timedelta(hours=24)).isoformat(),)); c0.commit(); c0.close()
-    except Exception as e: print('signal expiry skipped:',e)
     all_signals=rows("SELECT * FROM signals WHERE status='ACTIVE' ORDER BY id DESC LIMIT 100")
     if not email:
         return jsonify(ok=True,signals=[],trial=True,error='Login required to view signals. Free trial: 3 days or 3 signals.',pricing=PRICING)
@@ -305,7 +354,8 @@ def calendar():
 
 @app.post('/api/calendar/mt5')
 def calendar_mt5():
-    if not key_ok(request.headers.get('X-Calendar-Key',''),'MT5_CALENDAR_PUSH_KEY'):
+    key=os.getenv('MT5_CALENDAR_PUSH_KEY','CHANGE_ME')
+    if request.headers.get('X-Calendar-Key','') != key:
         return jsonify(ok=False,error='Unauthorized'),401
     d=request.get_json(force=True) or {}
     events=d.get('events',[])
@@ -370,66 +420,6 @@ def mt5_trade():
     c.commit(); c.close()
     return jsonify(ok=True)
 
-@app.post('/api/mt5/signal')
-def mt5_signal():
-    # GOLD TITAN AI EA pushes its BUY/SELL signals here; they appear in the website Signals tab.
-    if not website_api_ok(): return jsonify(ok=False,error='Unauthorized'),401
-    d=request.get_json(force=True) or {}
-    account=str(d.get('mt5_account','')).strip()
-    publisher=os.getenv('SIGNAL_PUBLISHER_ACCOUNT','').strip()
-    if publisher and account!=publisher: return jsonify(ok=False,error='This MT5 account is not allowed to publish signals'),403
-    direction=str(d.get('direction','')).upper()
-    if direction not in ('BUY','SELL'): return jsonify(ok=False,error='direction must be BUY or SELL'),400
-    symbol=str(d.get('symbol','XAUUSD')).upper()
-    def num(k):
-        try: return float(d.get(k)) if d.get(k) not in (None,'') else None
-        except (TypeError,ValueError): return None
-    reason=str(d.get('reason',''))[:300]
-    if num('tp3') is not None: reason=(reason+' | TP3: '+str(num('tp3'))).strip(' |')
-    c=db()
-    since=(now()-timedelta(minutes=30)).isoformat()
-    dup=c.execute("SELECT id FROM signals WHERE symbol=? AND direction=? AND created_at>? AND status='ACTIVE' LIMIT 1",(symbol,direction,since)).fetchone()
-    if dup: c.close(); return jsonify(ok=True,duplicate=True)
-    c.execute("UPDATE signals SET status='REPLACED' WHERE symbol=? AND status='ACTIVE'",(symbol,))
-    c.execute('INSERT INTO signals(symbol,direction,entry,sl,tp1,tp2,confidence,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)',
-              (symbol,direction,num('entry'),num('sl'),num('tp1'),num('tp2'),num('confidence'),reason,now().isoformat()))
-    c.commit(); c.close()
-    return jsonify(ok=True)
-
-@app.post('/api/ea/signal')
-def ea_signal():
-    # GOLD TITAN AI (OWNER build) publishes full-confirmation BUY/SELL signals here.
-    # Auth: "Authorization: Bearer <SIGNAL_API_KEY or WEBSITE_API_KEY>".
-    if not signal_api_ok(): return jsonify(ok=False,error='Unauthorized'),401
-    d=request.get_json(force=True,silent=True) or {}
-    direction=str(d.get('direction','')).strip().upper()
-    if direction not in ('BUY','SELL'): return jsonify(ok=False,error='direction must be BUY or SELL'),400
-    symbol=str(d.get('symbol','')).strip().upper()[:30]
-    if not symbol: return jsonify(ok=False,error='symbol required'),400
-    timeframe=str(d.get('timeframe','')).strip().upper()[:10]
-    def num(k):
-        try:
-            v=float(d.get(k))
-            return v if v>0 and v==v and v<1e9 else None
-        except (TypeError,ValueError): return None
-    entry,sl,tp1,tp2,tp3=num('entry'),num('sl'),num('tp1'),num('tp2'),num('tp3')
-    if None in (entry,sl,tp1,tp2,tp3): return jsonify(ok=False,error='entry, sl, tp1, tp2, tp3 must be positive numbers'),400
-    if direction=='BUY' and not (sl<entry<tp1<tp2<tp3): return jsonify(ok=False,error='BUY needs sl < entry < tp1 < tp2 < tp3'),400
-    if direction=='SELL' and not (sl>entry>tp1>tp2>tp3): return jsonify(ok=False,error='SELL needs sl > entry > tp1 > tp2 > tp3'),400
-    try: score=float(d.get('confidence')) if d.get('confidence') not in (None,'') else None
-    except (TypeError,ValueError): score=None
-    reason=str(d.get('reason',''))[:300]
-    bar_time=str(d.get('bar_time','')).strip()[:20]
-    c=db()
-    if bar_time:
-        dup=c.execute("SELECT id FROM signals WHERE symbol=? AND timeframe=? AND direction=? AND bar_time=? LIMIT 1",(symbol,timeframe,direction,bar_time)).fetchone()
-        if dup: c.close(); return jsonify(ok=True,duplicate=True)
-    c.execute("UPDATE signals SET status='REPLACED' WHERE symbol=? AND status='ACTIVE'",(symbol,))
-    c.execute('INSERT INTO signals(symbol,direction,entry,sl,tp1,tp2,tp3,confidence,reason,timeframe,bar_time,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
-              (symbol,direction,entry,sl,tp1,tp2,tp3,score,reason,timeframe,bar_time,now().isoformat()))
-    c.commit(); c.close()
-    return jsonify(ok=True)
-
 @app.get('/api/mt5/bot-control')
 def mt5_bot_control():
     if not bot_control_ok(): return jsonify(ok=False,error='Unauthorized'),401
@@ -478,6 +468,20 @@ def admin_status():
     d=request.get_json(force=True); status=d.get('status','').upper(); email=d.get('email','').strip().lower()
     if status not in ('APPROVED','REJECTED','SUSPENDED'): return jsonify(ok=False,error='Invalid status'),400
     c=db(); c.execute('UPDATE users SET status=? WHERE email=?',(status,email)); c.commit(); c.close(); send_email(email,'GOLD MASTERS account update',f'Your account status is now: {status}'); return jsonify(ok=True,status=status)
+
+@app.post('/api/admin/user-mt5')
+def admin_user_mt5():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True,silent=True) or {}
+    email=str(d.get('email','')).strip().lower(); acc=str(d.get('mt5_account','')).strip()
+    if not acc.isdigit() or not (4<=len(acc)<=12): return jsonify(ok=False,error='MT5 account must be 4 to 12 digits (numbers only)'),400
+    c=db()
+    u=c.execute('SELECT id,mt5_account FROM users WHERE email=?',(email,)).fetchone()
+    if not u: c.close(); return jsonify(ok=False,error='User not found'),404
+    other=c.execute('SELECT email FROM users WHERE mt5_account=? AND email<>?',(acc,email)).fetchone()
+    if other: c.close(); return jsonify(ok=False,error='This MT5 account number is already used by another customer'),409
+    c.execute('UPDATE users SET mt5_account=? WHERE email=?',(acc,email)); c.commit(); c.close()
+    return jsonify(ok=True,old=u['mt5_account'],mt5_account=acc)
 
 @app.post('/api/admin/payment-status')
 def admin_payment():
@@ -585,6 +589,40 @@ def ea_trade():
     c.execute('INSERT INTO bot_trades(mt5_account,event_type,side,ticket,symbol,price,lot,sl,tp,profit,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
               (str(d.get('account')).strip(),str(d.get('type',''))[:30],str(d.get('side',''))[:10],int(num('ticket')),
                str(d.get('symbol',''))[:30],num('price'),num('lot'),num('sl'),num('tp'),num('profit'),now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True)
+
+
+# ---- GOLD TITAN EA -> website Signals page (owner's EA only; protected by a secret key in Render) ----
+def signal_key_ok():
+    k=(os.getenv('SIGNAL_API_KEY','') or os.getenv('WEBSITE_API_KEY','')).strip()
+    if not k or k=='CHANGE_ME': return False
+    auth=request.headers.get('Authorization','')
+    token=auth.replace('Bearer ','').strip() if auth.startswith('Bearer ') else auth.strip()
+    return secrets.compare_digest(token,k)
+
+@app.post('/api/ea/signal')
+def ea_signal():
+    if not signal_key_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True,silent=True) or {}
+    direction=str(d.get('direction','')).upper()
+    if direction not in ('BUY','SELL'): return jsonify(ok=False,error='Invalid direction'),400
+    try:
+        entry,sl,tp1,tp2,tp3=[float(d.get(k)) for k in ('entry','sl','tp1','tp2','tp3')]
+        conf=float(d.get('confidence',0) or 0)
+    except (TypeError,ValueError): return jsonify(ok=False,error='Invalid numbers'),400
+    ok=(sl<entry<tp1<tp2<tp3) if direction=='BUY' else (tp3<tp2<tp1<entry<sl)
+    if not ok: return jsonify(ok=False,error='Price levels are not consistent'),400
+    symbol=''.join(ch for ch in str(d.get('symbol','XAUUSD')).upper() if ch.isalnum() or ch in '._#')[:20] or 'XAUUSD'
+    tf=str(d.get('timeframe',''))[:6]; bar=str(d.get('bar_time',''))[:20]; reason=str(d.get('reason',''))[:200]
+    key=symbol+'|'+tf+'|'+bar+'|'+direction
+    c=db()
+    if bar and c.execute('SELECT id FROM signals WHERE dedupe_key=?',(key,)).fetchone():
+        c.close(); return jsonify(ok=True,duplicate=True)
+    # EA signals stop being "ACTIVE" after 24 hours
+    c.execute("UPDATE signals SET status='EXPIRED' WHERE status='ACTIVE' AND dedupe_key IS NOT NULL AND created_at<?",((now()-timedelta(hours=24)).isoformat(),))
+    c.execute('INSERT INTO signals(symbol,direction,entry,sl,tp1,tp2,tp3,confidence,reason,created_at,timeframe,dedupe_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+              (symbol,direction,entry,sl,tp1,tp2,tp3,conf,reason,now().isoformat(),tf,(key if bar else None)))
     c.commit(); c.close()
     return jsonify(ok=True)
 
