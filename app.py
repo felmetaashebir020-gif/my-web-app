@@ -698,7 +698,14 @@ def ea_info():
     if err: return err
     e=latest_ea()
     if not e: return jsonify(ok=True,available=False)
-    return jsonify(ok=True,available=True,version=e['version'],filename=e['filename'],size=e['size'],uploaded_at=e['uploaded_at'])
+    c=db(); b=c.execute('SELECT version FROM bot_status WHERE mt5_account=?',(str(u['mt5_account']),)).fetchone(); c.close()
+    mine=(b['version'] if b and b.get('version') else '') or ''
+    def vf(x):
+        try: return float(str(x).lower().lstrip('v').strip())
+        except Exception: return None
+    a,l=vf(mine),vf(e['version'])
+    upd=bool(mine) and ((l>a) if (a is not None and l is not None) else mine.strip()!=str(e['version']).strip())
+    return jsonify(ok=True,available=True,version=e['version'],filename=e['filename'],size=e['size'],uploaded_at=e['uploaded_at'],your_version=mine,update_available=upd)
 
 @app.get('/api/ea/download')
 def ea_download():
@@ -797,6 +804,48 @@ def contact():
     ok=send_telegram(chat,'New support message\nName: '+name+'\nTelegram: '+tg+'\nSubject: '+(subj or '-')+'\n\n'+msg_)
     if not ok: return jsonify(ok=False,error='Could not deliver the message. Please use the Telegram support button.'),502
     return jsonify(ok=True,message='Message sent. We will reply to you on Telegram.')
+
+
+# ---------------- Forgot password: OTP sent to the user's Telegram ----------------
+def find_user_by_ident(ident):
+    ident=(ident or '').strip().lower()
+    if not ident: return None
+    c=db(); u=c.execute('SELECT * FROM users WHERE LOWER(username)=? OR LOWER(email)=? OR telegram_chat_id=?',(ident,ident,ident)).fetchone(); c.close()
+    return u
+
+@app.post('/api/forgot-password')
+def forgot_password():
+    d=request.get_json(force=True,silent=True) or {}; ident=str(d.get('identifier','')).strip().lower()
+    if not ident: return jsonify(ok=False,error='Enter your username or Telegram ID'),400
+    if not rate_ok('fp:'+client_ip(),10,3600) or not rate_ok('fpid:'+ident,3,3600):
+        return jsonify(ok=False,error='Too many attempts. Please try again in an hour.'),429
+    u=find_user_by_ident(ident)
+    generic=jsonify(ok=True,message='If this account exists, a 6-digit code was sent to its Telegram. Make sure you pressed Start on @goldmasters_otp_bot.')
+    if not u or not u.get('telegram_chat_id'): return generic
+    code=otp(u['email'],'RESET')
+    sent=send_telegram(u['telegram_chat_id'],'GOLD MASTERS password reset\n\nYour code is: '+code+'\nExpires in '+str(OTP_MINUTES)+' minutes.\nIf you did not ask for this, ignore this message and do not share the code.')
+    if not sent: return jsonify(ok=False,error=tg_error()),502
+    return generic
+
+@app.post('/api/reset-password')
+def reset_password():
+    d=request.get_json(force=True,silent=True) or {}
+    ident=str(d.get('identifier','')).strip().lower(); code=str(d.get('code','')).strip(); pw=str(d.get('new_password',''))
+    if not ident or not code or not pw: return jsonify(ok=False,error='Enter your username, the code and a new password'),400
+    if len(pw)<8: return jsonify(ok=False,error='Password must be at least 8 characters'),400
+    if not rate_ok('rp:'+client_ip(),30,3600) or not rate_ok('rpid:'+ident,6,900):
+        return jsonify(ok=False,error='Too many attempts. Please request a new code later.'),429
+    u=find_user_by_ident(ident)
+    bad=jsonify(ok=False,error='Invalid or expired code'),400
+    if not u: return bad
+    c=db(); r=c.execute("SELECT * FROM otps WHERE email=? AND purpose='RESET' AND used=0 ORDER BY id DESC LIMIT 1",(u['email'],)).fetchone()
+    if not r or r['expires_at']<now().isoformat() or not secrets.compare_digest(r['code_hash'],h(code)): c.close(); return bad
+    c.execute('UPDATE otps SET used=1 WHERE id=?',(r['id'],))
+    c.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_pw(pw),u['id']))
+    c.execute('DELETE FROM sessions WHERE user_id=?',(u['id'],))   # log out every old session
+    c.commit(); c.close()
+    if u.get('telegram_chat_id'): send_telegram(u['telegram_chat_id'],'GOLD MASTERS: your password was changed. If this was not you, contact support right away.')
+    return jsonify(ok=True,message='Password changed. You can log in now.')
 
 @app.get('/api/health')
 def health(): return jsonify(ok=True,service='GOLD MASTERS API',time=now().isoformat())
