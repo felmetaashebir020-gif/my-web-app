@@ -115,3 +115,42 @@ async function resetPassword(){
  if(!b.identifier||!b.code||!b.new_password){$('rstStatus').textContent='Enter your username, the code and a new password.';return}
  try{let r=await fetch(api()+'/api/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let x=await r.json();if(!r.ok)throw new Error(x.error||'Failed');$('rstStatus').textContent=x.message;$('rstCode').value='';$('rstPw').value='';msg('Password changed');setTimeout(()=>showAuth('login'),1200)}catch(e){$('rstStatus').textContent=e.message}
 }
+
+// ---------- Mobile tab bar, install prompt, AI brief ----------
+(function(){
+ const _show=show;
+ window.show=function(id){_show(id);try{document.querySelectorAll('#tabbar button').forEach(b=>b.classList.toggle('active',b.dataset.p===id));if(id==='ai')loadAI(false);window.scrollTo(0,0)}catch(e){}};
+ try{document.querySelector('#tabbar [data-p="dash"]').classList.add('active')}catch(e){}
+})();
+let _deferredInstall=null;
+window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();_deferredInstall=e;let b=$('installBtn');if(b)b.style.display='inline-block'});
+window.addEventListener('appinstalled',()=>{_deferredInstall=null;let b=$('installBtn');if(b)b.style.display='none'});
+async function installApp(){if(!_deferredInstall){msg('On iPhone: tap Share, then Add to Home Screen.');return}_deferredInstall.prompt();await _deferredInstall.userChoice;_deferredInstall=null;let b=$('installBtn');if(b)b.style.display='none'}
+let _aiLang=localStorage.getItem('gmAiLang')||'en',_aiBusy=false,_aiLoaded=0;
+function setAiLang(l){_aiLang=l;try{localStorage.setItem('gmAiLang',l)}catch(e){}_aiLoaded=0;$('aiLangEn').classList.toggle('active',l==='en');$('aiLangAm').classList.toggle('active',l==='am');loadAI(true)}
+function aiTile(label,val,cls){let d=document.createElement('div');d.className='aiTile '+(cls||'');let s=document.createElement('small');s.textContent=label;let b=document.createElement('b');b.textContent=val;d.appendChild(s);d.appendChild(b);return d}
+async function loadAI(force){
+ if(_aiBusy)return;if(!force&&_aiLoaded&&Date.now()-_aiLoaded<60000)return;
+ const tok=localStorage.getItem('gmToken');
+ if(!tok){$('aiText').textContent='Log in with an approved account to see the AI brief.';return}
+ _aiBusy=true;$('aiText').textContent=_aiLang==='am'?'በመተንተን ላይ…':'Analysing the market…';
+ try{
+  let r=await fetch(api()+'/api/ai/brief?lang='+_aiLang,{headers:{Authorization:'Bearer '+tok}});let j=await r.json();
+  if(!r.ok)throw new Error(j.error||'Could not load the brief');
+  let f=j.facts||{},t=$('aiTiles');t.innerHTML='';
+  if(f.price){
+   t.appendChild(aiTile('XAUUSD',f.price));
+   t.appendChild(aiTile('Trend (1h)',f.trend==='up'?'▲ Bullish':f.trend==='down'?'▼ Bearish':'◆ Mixed',f.trend==='up'?'up':f.trend==='down'?'down':''));
+   t.appendChild(aiTile('RSI 14',f.rsi14));
+   t.appendChild(aiTile('24h change',f.change_24h_pct+'%',f.change_24h_pct>=0?'up':'down'));
+   t.appendChild(aiTile('24h high / low',f.high_24h+' / '+f.low_24h));
+   t.appendChild(aiTile('ATR 14',f.atr14));
+  }
+  if(f.news&&f.news.length)f.news.forEach(n=>t.appendChild(aiTile('News',n.event+(n.in_minutes>0?' in '+n.in_minutes+' min':' now'))));
+  $('aiText').textContent=j.text;
+  let bd=$('aiBadge');bd.textContent=j.source==='ai'?'AI':'Auto';bd.classList.remove('hidden');
+  $('aiMeta').textContent='Updated '+new Date(j.generated_at).toLocaleTimeString()+(j.source==='ai'?' • written by AI from the data above':' • rule-based summary');
+  _aiLoaded=Date.now();
+ }catch(e){$('aiText').textContent=e.message}
+ _aiBusy=false;
+}
