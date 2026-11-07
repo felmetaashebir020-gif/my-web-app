@@ -1,6 +1,6 @@
 import os, secrets, hashlib, smtplib, requests
 import psycopg2, psycopg2.extras
-import socket, time
+import socket, time, json
 
 # --- Force IPv4 for outbound connections (fixes "Network is unreachable" on Render) ---
 _orig_getaddrinfo = socket.getaddrinfo
@@ -846,6 +846,106 @@ def reset_password():
     c.commit(); c.close()
     if u.get('telegram_chat_id'): send_telegram(u['telegram_chat_id'],'GOLD MASTERS: your password was changed. If this was not you, contact support right away.')
     return jsonify(ok=True,message='Password changed. You can log in now.')
+
+
+# ---------------- AI market brief (mobile AI dashboard) ----------------
+AI_CACHE={}
+def _ema(v,n):
+    k=2/(n+1); e=sum(v[:n])/n
+    for x in v[n:]: e=x*k+e*(1-k)
+    return e
+def _rsi(v,n=14):
+    g=l=0.0
+    for i in range(1,n+1):
+        d=v[i]-v[i-1]; g+=max(d,0); l+=max(-d,0)
+    g/=n; l/=n
+    for i in range(n+1,len(v)):
+        d=v[i]-v[i-1]; g=(g*(n-1)+max(d,0))/n; l=(l*(n-1)+max(-d,0))/n
+    return 100.0 if l==0 else 100-100/(1+g/l)
+def _atr(c,n=14):
+    trs=[]
+    for i in range(1,len(c)):
+        h,l,_=c[i]; pc=c[i-1][2]; trs.append(max(h-l,abs(h-pc),abs(l-pc)))
+    a=sum(trs[:n])/n
+    for t in trs[n:]: a=(a*(n-1)+t)/n
+    return a
+
+def ai_facts():
+    """Real numbers only. The AI (or the rule-based fallback) may use nothing else."""
+    f={'symbol':'XAUUSD','timeframe':'1h','as_of':now().isoformat()}
+    key=os.getenv('TWELVEDATA_API_KEY','').strip()
+    if key:
+        try:
+            r=requests.get('https://api.twelvedata.com/time_series',params={'symbol':'XAU/USD','interval':'1h','outputsize':120,'apikey':key},timeout=15).json()
+            vals=list(reversed(r.get('values') or []))
+            if len(vals)>=60:
+                cl=[float(x['close']) for x in vals]; hi=[float(x['high']) for x in vals]; lo=[float(x['low']) for x in vals]
+                e20,e50=_ema(cl,20),_ema(cl,50)
+                f.update(price=round(cl[-1],2),ema20=round(e20,2),ema50=round(e50,2),rsi14=round(_rsi(cl),1),atr14=round(_atr(list(zip(hi,lo,cl))),2),
+                         high_24h=round(max(hi[-24:]),2),low_24h=round(min(lo[-24:]),2),change_24h_pct=round((cl[-1]/cl[-25]-1)*100,2),
+                         trend='up' if (e20>e50 and cl[-1]>e50) else 'down' if (e20<e50 and cl[-1]<e50) else 'mixed')
+        except Exception as e:
+            print('ai_facts market error:',e)
+    try:
+        f['signals']=[{'direction':s['direction'],'entry':s['entry'],'sl':s['sl'],'tp1':s['tp1'],'tp2':s['tp2'],'confidence':s['confidence'],'created_at':s['created_at']}
+                      for s in rows("SELECT direction,entry,sl,tp1,tp2,confidence,created_at FROM signals WHERE status='ACTIVE' ORDER BY id DESC LIMIT 3")]
+    except Exception as e: f['signals']=[]
+    n=now(); nw=[]
+    for e in news_events():
+        mins=round((e['time']-n).total_seconds()/60)
+        if -60<=mins<=1440: nw.append({'event':e['event'],'in_minutes':mins})
+    f['news']=sorted(nw,key=lambda x:x['in_minutes'])[:5]
+    return f
+
+def ai_rules_text(f):
+    if not f.get('price') and not f.get('signals') and not f.get('news'):
+        return 'Market data is not available right now, so no analysis can be produced. Please try again later.'
+    L=[]
+    if f.get('price'):
+        t={'up':'bullish (EMA20 above EMA50, price above both)','down':'bearish (EMA20 below EMA50, price below both)','mixed':'mixed / range-bound'}[f['trend']]
+        rs=f['rsi14']; rt='overbought' if rs>=70 else 'oversold' if rs<=30 else 'neutral'
+        L.append('Bias: '+t+'. RSI(14) is '+str(rs)+' ('+rt+'); 24h change '+str(f['change_24h_pct'])+'%.')
+        L.append('Key levels: price '+str(f['price'])+', 24h high '+str(f['high_24h'])+', 24h low '+str(f['low_24h'])+'. Typical hourly range (ATR) is about '+str(f['atr14'])+'.')
+    if f.get('signals'):
+        s=f['signals'][0]; L.append('Latest signal: '+str(s['direction'])+' near '+str(s['entry'])+', SL '+str(s['sl'])+', TP1 '+str(s['tp1'])+' (confidence '+str(s['confidence'])+'%).')
+    if f.get('news'):
+        L.append('News risk: '+'; '.join((x['event']+(' in '+str(x['in_minutes'])+' min' if x['in_minutes']>0 else ' (just released)')) for x in f['news'])+'. Expect fast moves and wider spreads.')
+    else: L.append('News risk: no high-impact USD news in the next 24 hours.')
+    L.append('Risk reminder: use a stop loss on every trade and risk only what you can afford to lose. This is information, not a guarantee.')
+    return '\n'.join(L)
+
+def ai_llm_text(f,lang):
+    key=os.getenv('ANTHROPIC_API_KEY','').strip()
+    if not key: return None
+    system=('You are the market analyst inside the GOLD MASTERS gold (XAUUSD) trading dashboard. Use ONLY the facts JSON the user sends. '
+            'Never invent prices, levels, news or numbers; if something is missing, say it is unavailable. '
+            'Never promise profit and never give a direct order to buy or sell: describe the bias, scenarios and levels to watch. '
+            'Write exactly four short labeled lines: Bias, Key levels, News risk, Risk reminder. Maximum 170 words in total. Plain text, no markdown.')
+    if lang=='am': system+=' Write the whole answer in Amharic (አማርኛ, Ethiopic script). Keep numbers in digits.'
+    try:
+        r=requests.post('https://api.anthropic.com/v1/messages',headers={'x-api-key':key,'anthropic-version':'2023-06-01','content-type':'application/json'},
+            json={'model':os.getenv('AI_MODEL','claude-sonnet-5-5'),'max_tokens':700,'system':system,'messages':[{'role':'user','content':'Facts:\n'+json.dumps(f)}]},timeout=40)
+        if r.status_code>=400:
+            print('ai_llm error',r.status_code,r.text[:200]); return None
+        t=''.join(b.get('text','') for b in r.json().get('content',[]) if b.get('type')=='text').strip()
+        return t or None
+    except Exception as e:
+        print('ai_llm exception:',e); return None
+
+@app.get('/api/ai/brief')
+def ai_brief():
+    u,err=ea_user()
+    if err: return err
+    if not rate_ok('ai:'+str(u['id']),20,3600): return jsonify(ok=False,error='Too many requests. Please try again later.'),429
+    lang='am' if request.args.get('lang')=='am' else 'en'
+    ent=AI_CACHE.get(lang)
+    if ent and time.time()-ent['t']<600: return jsonify(ok=True,cached=True,**ent['data'])
+    f=ai_facts(); text=ai_llm_text(f,lang) if (f.get('price') or f.get('signals') or f.get('news')) else None
+    source='ai' if text else 'rules'
+    if not text: text=ai_rules_text(f)
+    data={'text':text,'source':source,'facts':f,'generated_at':now().isoformat(),'lang':lang}
+    AI_CACHE[lang]={'t':time.time(),'data':data}
+    return jsonify(ok=True,cached=False,**data)
 
 @app.get('/api/health')
 def health(): return jsonify(ok=True,service='GOLD MASTERS API',time=now().isoformat())
