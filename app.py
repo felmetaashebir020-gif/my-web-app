@@ -1,36 +1,822 @@
-const $=id=>document.getElementById(id); const api=()=>$('api').value.replace(/\/$/,'');
-function msg(x){$('msg').textContent=x; setTimeout(()=>$('msg').textContent='',5000)}
-function show(id){document.querySelectorAll('.page').forEach(x=>x.classList.add('hidden'));$(id).classList.remove('hidden'); if(id==='signals')loadSignals(); if(id==='dash'&&!window.gmChartLoaded)loadTVChart('XAUUSD'); if(id==='admin'){const k=localStorage.getItem('gmAdminKey');if(k)$('adminKey').value=k}}
-function sendContact(){const n=$('contactName').value.trim(),e=$('contactEmail').value.trim(),s=$('contactSubject').value.trim(),m=$('contactMessage').value.trim();if(!n||!e||!m){$('contactStatus').textContent='Please enter your name, email and message.';return} $('contactStatus').textContent='Message prepared. Please connect the contact form to your support email/API in the backend to deliver it.';msg('Contact message ready.')}
-async function req(path,opt={}){let r=await fetch(api()+path,{headers:{'Content-Type':'application/json',...(localStorage.getItem('gmToken')?{Authorization:'Bearer '+localStorage.getItem('gmToken')}:{}),...(opt.headers||{})},...opt});let j=await r.json();if(!r.ok)throw new Error(j.error||'Request failed');return j}
-async function health(){try{let j=await req('/api/health');msg('API online: '+j.time);loadSymbols()}catch(e){msg(e.message)}}
-async function loadSymbols(){try{let j=await req('/api/market/symbols');$('symbols').innerHTML=j.symbols.map(s=>`<button onclick="quote('${s}')">${s}</button>`).join(' ');$('marketStatus').textContent='Provider: '+j.provider}catch(e){$('symbols').textContent=e.message}}
-const tvMap={XAUUSD:'OANDA:XAUUSD',XAGUSD:'OANDA:XAGUSD',EURUSD:'OANDA:EURUSD',GBPUSD:'OANDA:GBPUSD',USDJPY:'OANDA:USDJPY',USDCHF:'OANDA:USDCHF',USDCAD:'OANDA:USDCAD',AUDUSD:'OANDA:AUDUSD',NZDUSD:'OANDA:NZDUSD',EURJPY:'OANDA:EURJPY',GBPJPY:'OANDA:GBPJPY',BTCUSD:'BITSTAMP:BTCUSD',ETHUSD:'BITSTAMP:ETHUSD',NAS100:'OANDA:NAS100USD',US30:'OANDA:US30USD'};
-function loadTVChart(s){$('chartTitle').textContent='Live Chart — '+s; $('tvChart').innerHTML=''; window.gmChartLoaded=true; if(window.TradingView){new TradingView.widget({autosize:true,symbol:tvMap[s]||s,interval:'5',timezone:'Etc/UTC',theme:'dark',style:'1',locale:'en',toolbar_bg:'#f1f3f6',enable_publishing:false,allow_symbol_change:true,container_id:'tvChart'});} else {$('tvChart').textContent='Chart library loading…';}}
-async function quote(s){loadTVChart(s);try{let j=await req('/api/market/quote/'+s);let q=j.quote;$('quoteBox').innerHTML='<b>'+j.symbol+'</b><br>Price: '+(q.close??'—')+'<br>Open: '+(q.open??'—')+'<br>High: '+(q.high??'—')+'<br>Low: '+(q.low??'—')+'<br>Change: '+(q.percent_change??'—')+'%<br>Time: '+(q.datetime??'—');$('marketStatus').textContent='Live provider: '+j.provider}catch(e){$('quoteBox').textContent=e.message;msg(e.message)}}
-async function loadCalendar(country){try{let j=await req('/api/calendar?country='+encodeURIComponent(country));let ev=j.events||[];$('calendarList').innerHTML=ev.length?'<table><tr><th>Date</th><th>Country</th><th>Event</th><th>Importance</th><th>Actual</th><th>Forecast</th><th>Previous</th></tr>'+ev.map(x=>'<tr><td>'+((x.Date||x.date||'').toString().replace('T',' ').slice(0,19))+'</td><td>'+(x.Country||x.country||'')+'</td><td>'+(x.Event||x.event||'')+'</td><td>'+(x.Importance||x.importance||'')+'</td><td>'+(x.Actual??x.actual??'')+'</td><td>'+(x.Forecast??x.forecast??'')+'</td><td>'+(x.Previous??x.previous??'')+'</td></tr>').join('')+'</table>':'No events returned.';}catch(e){$('calendarList').textContent=e.message;msg(e.message)}}
-async function register(){try{let body={full_name:$('name').value,email:$('email').value,username:$('username').value,phone:$('phone').value,telegram_chat_id:$('telegramChatId').value,mt5_account:$('mt5').value,password:$('password').value};let j=await req('/api/register',{method:'POST',body:JSON.stringify(body)});msg(j.message)}catch(e){msg(e.message)}}
-async function verifyOtp(){try{let j=await req('/api/verify-email',{method:'POST',body:JSON.stringify({email:$('email').value,code:$('otp').value})});msg('Email verified. Status: '+j.status)}catch(e){msg(e.message)}}
-async function login(){try{let j=await req('/api/login',{method:'POST',body:JSON.stringify({username_or_email:$('loginId').value,password:$('loginPw').value})});localStorage.setItem('gmEmail',j.user.email);localStorage.setItem('gmToken',j.token||'');$('loginOut').textContent=JSON.stringify(j.user,null,2);let b=$('licenseBox');b.classList.remove('hidden');b.innerHTML='<b>EA License Key</b><br>Paste this into the EA\'s <code>LicenseKey</code> input. It works only on MT5 account <code>'+j.user.mt5_account+'</code> (the EA reads the account number by itself):<br><code>'+j.user.license_key+'</code>';msg('Login successful')}catch(e){msg(e.message)}}
-async function setMembership(){try{let body={email:$('memEmail').value,membership:$('memTier').value,membership_expiry:$('memExpiry').value||null};let j=await req('/api/admin/membership',{method:'POST',headers:{'X-Admin-Key':$('adminKey').value},body:JSON.stringify(body)});$('memStatus').textContent='Saved: '+j.membership+(j.membership_expiry?(' until '+j.membership_expiry):'');msg('Membership updated')}catch(e){$('memStatus').textContent=e.message;msg(e.message)}}
-const cryptoAddresses={BEP20:'0x8d1747458052facabe4ed43436a691ef70865b07',TRC20:'TY4vHjWgohGsfvh4PC95znuvp5ovM7Tph4'};
-function updateDepositAddress(){const net=$('depNetwork').value;$('depAddress').textContent=cryptoAddresses[net]}
-async function payment(kind){try{let amount=kind==='DEPOSIT'?$('depAmount').value:$('withAmount').value;let network=kind==='DEPOSIT'?$('depNetwork').value:$('withNetwork').value;let destination=kind==='DEPOSIT'?cryptoAddresses[network]:$('withDest').value;let body={email:$('payEmail').value,kind,amount,currency:'USD',method:network,reference:$('depRef').value,destination};let j=await req('/api/payment-request',{method:'POST',body:JSON.stringify(body)});msg(kind+' request: '+j.status)}catch(e){msg(e.message)}}
-async function loadSignals(){try{let j=await req('/api/signals');if(j.error){$('signalList').innerHTML='<p class="muted">'+j.error+'</p><button onclick="goDeposit()">Deposit for membership</button>';return}let extra=(j.trial&&typeof j.trial_signals_remaining!=='undefined')?`<p class="muted">Free trial: ${j.trial_signals_remaining} signal(s) remaining.</p>`:'';$('signalList').innerHTML=extra+(j.signals.length?`<table><tr><th>Symbol</th><th>TF</th><th>Direction</th><th>Entry</th><th>SL</th><th>TP1</th><th>TP2</th><th>TP3</th><th>Setup score</th><th></th></tr>${j.signals.map(x=>`<tr><td>${x.symbol}</td><td>${x.timeframe??''}</td><td>${x.direction}</td><td>${x.entry??''}</td><td>${x.sl??''}</td><td>${x.tp1??''}</td><td>${x.tp2??''}</td><td>${x.tp3??''}</td><td>${x.confidence??''}</td><td><button onclick="goDeposit('${x.symbol} ${x.direction}${x.entry?' @ '+x.entry:''}')">Follow</button></td></tr>`).join('')}</table>`:'No active signals yet.')}catch(e){msg(e.message)}}
-function botCell(x){
- if(!x.mt5_account) return '<span class="muted">-</span>';
- let paused=(x.bot_enabled===0||x.bot_enabled===false);
- let seen=x.bot_seen?Date.parse(x.bot_seen):0;
- let online=seen&&(Date.now()-seen<180000);
- let info=!seen?'<span class="muted">never connected</span>':((online?'ONLINE':'offline')+'<br><span class="muted">eq '+(x.bot_equity==null?'?':Number(x.bot_equity).toFixed(2))+' | pos '+(x.bot_positions||0)+(x.bot_version?' | v'+x.bot_version:'')+'</span>');
- return info+(paused?'<br><b>PAUSED</b> ':'<br>')+'<button onclick="adminBotControl(\''+x.mt5_account+'\','+(paused?'true':'false')+')">'+(paused?'Resume':'Pause')+'</button>';
-}
-async function adminBotControl(account,enabled){try{await req('/api/admin/bot-control',{method:'POST',headers:{'X-Admin-Key':$('adminKey').value||localStorage.getItem('gmAdminKey')||''},body:JSON.stringify({mt5_account:account,enabled})});msg('EA '+account+(enabled?' resumed':' paused'));loadAdmin()}catch(e){msg(e.message)}}
-async function adminChangeMt5(email,old){let n=prompt('New MT5 account number for '+email+' (numbers only). Current: '+(old||'none'),old||'');if(n===null)return;n=n.trim();if(!n)return;try{await req('/api/admin/user-mt5',{method:'POST',headers:{'X-Admin-Key':$('adminKey').value||localStorage.getItem('gmAdminKey')||''},body:JSON.stringify({email:email,mt5_account:n})});msg('MT5 account changed to '+n);loadAdmin()}catch(e){msg(e.message)}}
-async function loadAdmin(){let key=$('adminKey').value;localStorage.setItem('gmAdminKey',key);try{let [u,p]=await Promise.all([req('/api/admin/users',{headers:{'X-Admin-Key':key}}),req('/api/admin/payments',{headers:{'X-Admin-Key':key}})]);
-$('adminUsers').innerHTML='<h3>Users</h3>'+(u.users.length?`<table><tr><th>Name</th><th>Email</th><th>MT5</th><th>Status</th><th>Membership</th><th>EA</th><th>Action</th></tr>${u.users.map(x=>`<tr><td>${x.full_name}</td><td>${x.email}</td><td>${x.mt5_account??''}</td><td>${x.status}</td><td>${x.membership}</td><td>${botCell(x)}</td><td>${x.status==='PENDING'?`<button onclick="adminUserStatus('${x.email}','APPROVED')">Approve</button><button onclick="adminUserStatus('${x.email}','REJECTED')">Reject</button>`:`<button onclick="adminUserStatus('${x.email}','SUSPENDED')">Suspend</button>`}<br><button onclick="adminChangeMt5(\'${x.email}\',\'${x.mt5_account||''}\')">Edit MT5</button></td></tr>`).join('')}</table>`:'No users yet.');
-$('adminPayments').innerHTML='<h3>Payments</h3>'+(p.payments.length?`<table><tr><th>User</th><th>Kind</th><th>Amount</th><th>Method</th><th>Ref</th><th>Status</th><th>Action</th></tr>${p.payments.map(x=>`<tr><td>${x.full_name}<br><span class="muted">${x.email}</span></td><td>${x.kind}</td><td>${x.amount} ${x.currency}</td><td>${x.method||''}</td><td>${x.reference||''}</td><td>${x.status}</td><td>${x.status==='PENDING'?`<button onclick="adminPaymentStatus(${x.id},'APPROVED')">Approve</button><button onclick="adminPaymentStatus(${x.id},'REJECTED')">Reject</button>`:''}</td></tr>`).join('')}</table>`:'No payment requests yet.');
-}catch(e){msg(e.message)}}
-async function adminUserStatus(email,status){try{await req('/api/admin/user-status',{method:'POST',headers:{'X-Admin-Key':$('adminKey').value||localStorage.getItem('gmAdminKey')||''},body:JSON.stringify({email,status})});msg('User '+email+' -> '+status);loadAdmin()}catch(e){msg(e.message)}}
-async function adminPaymentStatus(id,status){try{await req('/api/admin/payment-status',{method:'POST',headers:{'X-Admin-Key':$('adminKey').value||localStorage.getItem('gmAdminKey')||''},body:JSON.stringify({payment_id:id,status})});msg('Payment #'+id+' -> '+status);loadAdmin()}catch(e){msg(e.message)}}
-loadSymbols(); setTimeout(()=>loadTVChart('XAUUSD'),300);
+import os, secrets, hashlib, smtplib, requests
+import psycopg2, psycopg2.extras
+import socket, time
+
+# --- Force IPv4 for outbound connections (fixes "Network is unreachable" on Render) ---
+_orig_getaddrinfo = socket.getaddrinfo
+def _ipv4_getaddrinfo(*args, **kwargs):
+    return [r for r in _orig_getaddrinfo(*args, **kwargs) if r[0] == socket.AF_INET]
+socket.getaddrinfo = _ipv4_getaddrinfo
+# ---------------------------------------------------------------------------------------
+
+from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from flask import Flask, request, jsonify, Response
+from flask_cors import CORS
+
+app = Flask(__name__); CORS(app)
+app.config['MAX_CONTENT_LENGTH']=10*1024*1024   # 10 MB (EA upload limit)
+
+DATABASE_URL = os.getenv('DATABASE_URL', '')
+if DATABASE_URL.startswith('postgres://'):
+    DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+OTP_MINUTES = int(os.getenv('OTP_MINUTES', '10'))
+
+class PgCursorWrapper:
+    def __init__(self, cur): self._cur = cur
+    def fetchone(self):
+        r = self._cur.fetchone(); return dict(r) if r is not None else None
+    def fetchall(self):
+        return [dict(r) for r in self._cur.fetchall()]
+
+class PgConn:
+    def __init__(self):
+        self._conn = psycopg2.connect(DATABASE_URL, connect_timeout=10)
+    def execute(self, query, params=()):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query.replace('?', '%s'), params)
+        return PgCursorWrapper(cur)
+    def executescript(self, script):
+        cur = self._conn.cursor(); cur.execute(script); cur.close()
+    def commit(self): self._conn.commit()
+    def close(self): self._conn.close()
+
+def now(): return datetime.now(timezone.utc)
+def db(): return PgConn()
+def h(v): return hashlib.sha256(v.encode()).hexdigest()
+PW_ITER=200000
+def hash_pw(pw):
+    salt=secrets.token_hex(16)
+    dk=hashlib.pbkdf2_hmac('sha256',pw.encode(),bytes.fromhex(salt),PW_ITER).hex()
+    return f'pbkdf2${PW_ITER}${salt}${dk}'
+def check_pw(pw,stored):
+    if not stored: return False
+    if stored.startswith('pbkdf2$'):
+        try:
+            _,it,salt,dk=stored.split('$')
+            calc=hashlib.pbkdf2_hmac('sha256',pw.encode(),bytes.fromhex(salt),int(it)).hex()
+        except Exception: return False
+        return secrets.compare_digest(calc.encode(),dk.encode())
+    return secrets.compare_digest(h(pw).encode(),stored.encode())   # legacy unsalted hash
+def rows(q,p=()):
+    c=db(); r=c.execute(q,p).fetchall(); c.close(); return r
+
+def init():
+    if not DATABASE_URL:
+        print('WARNING: DATABASE_URL is not set. Set it to your PostgreSQL connection string. '
+              'The app will start, but every database operation will fail until this is fixed.')
+        return
+    try:
+        c=db(); c.executescript('''
+CREATE TABLE IF NOT EXISTS users(id SERIAL PRIMARY KEY,full_name TEXT NOT NULL,email TEXT NOT NULL UNIQUE,phone TEXT,username TEXT NOT NULL UNIQUE,password_hash TEXT NOT NULL,mt5_account TEXT,email_verified INTEGER DEFAULT 0,status TEXT DEFAULT 'PENDING',membership TEXT DEFAULT 'FREE',membership_expiry TEXT,created_at TEXT NOT NULL,last_login TEXT,wallet_balance REAL DEFAULT 0,license_key TEXT);
+CREATE TABLE IF NOT EXISTS otps(id SERIAL PRIMARY KEY,email TEXT NOT NULL,code_hash TEXT NOT NULL,expires_at TEXT NOT NULL,purpose TEXT NOT NULL,used INTEGER DEFAULT 0);
+CREATE TABLE IF NOT EXISTS payments(id SERIAL PRIMARY KEY,user_id INTEGER NOT NULL,kind TEXT NOT NULL,amount REAL NOT NULL,currency TEXT NOT NULL,method TEXT,reference TEXT,destination TEXT,status TEXT DEFAULT 'PENDING',created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS signals(id SERIAL PRIMARY KEY,symbol TEXT NOT NULL,direction TEXT NOT NULL,entry REAL,sl REAL,tp1 REAL,tp2 REAL,confidence REAL,reason TEXT,created_at TEXT NOT NULL,status TEXT DEFAULT 'ACTIVE');
+CREATE TABLE IF NOT EXISTS mt5_calendar(id SERIAL PRIMARY KEY,time TEXT,currency TEXT,country TEXT,event TEXT,importance INTEGER,actual REAL,forecast REAL,previous REAL,received_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bot_status(mt5_account TEXT PRIMARY KEY,state TEXT,broker TEXT,server TEXT,symbol TEXT,balance REAL,equity REAL,free_margin REAL,spread_points REAL,positions INTEGER,daily_stop INTEGER DEFAULT 0,daily_profit_stop INTEGER DEFAULT 0,drawdown_stop INTEGER DEFAULT 0,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bot_trades(id SERIAL PRIMARY KEY,mt5_account TEXT,event_type TEXT,side TEXT,ticket BIGINT,symbol TEXT,price REAL,lot REAL,sl REAL,tp REAL,profit REAL,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bot_control(mt5_account TEXT PRIMARY KEY,enabled INTEGER DEFAULT 1,updated_at TEXT NOT NULL);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS license_key TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS signals_viewed_count INTEGER DEFAULT 0;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
+CREATE TABLE IF NOT EXISTS sessions(token_hash TEXT PRIMARY KEY,user_id INTEGER NOT NULL,created_at TEXT NOT NULL,expires_at TEXT NOT NULL);
+ALTER TABLE bot_status ADD COLUMN IF NOT EXISTS version TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS tp3 REAL;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe TEXT;
+ALTER TABLE signals ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_dedupe ON signals(dedupe_key);
+CREATE TABLE IF NOT EXISTS ea_files(id SERIAL PRIMARY KEY,version TEXT NOT NULL,filename TEXT NOT NULL,data BYTEA NOT NULL,size INTEGER NOT NULL,uploaded_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS ea_downloads(id SERIAL PRIMARY KEY,user_id INTEGER NOT NULL,ea_id INTEGER NOT NULL,version TEXT,ip TEXT,downloaded_at TEXT NOT NULL);
+'''); c.commit(); c.close()
+    except Exception as e:
+        print('WARNING: could not connect to DATABASE_URL at startup: ' + str(e) +
+              '. The app will still start, but database operations will fail until this is fixed. '
+              'Check /api/admin/db-check once deployed.')
+
+EMAIL_ERR=['']
+def email_error():
+    return EMAIL_ERR[0] or 'Could not send the verification email.'
+
+def send_email(to,subject,body):
+    EMAIL_ERR[0]=''
+    api_key=os.getenv('RESEND_API_KEY','').strip()
+    sender=os.getenv('SMTP_FROM','onboarding@resend.dev').strip()
+    if not api_key:
+        print('EMAIL NOT CONFIGURED',subject,to)
+        EMAIL_ERR[0]='Email service is not configured on the server (RESEND_API_KEY missing).'
+        return False
+    try:
+        r=requests.post('https://api.resend.com/emails',
+            headers={'Authorization':f'Bearer {api_key}','Content-Type':'application/json'},
+            json={'from':sender,'to':[to],'subject':subject,'text':body},
+            timeout=15)
+        if r.status_code>=400:
+            print('EMAIL SEND FAILED:', r.status_code, r.text)
+            try: msg=str(r.json().get('message',''))
+            except Exception: msg=''
+            low=msg.lower()
+            if 'verify a domain' in low or 'testing emails' in low or 'domain is not verified' in low:
+                EMAIL_ERR[0]='Server problem: the sending email domain is not verified yet (Resend). Please contact support.'
+            elif r.status_code in (401,403) and 'api key' in low:
+                EMAIL_ERR[0]='Server problem: the email API key is wrong (Resend).'
+            else:
+                EMAIL_ERR[0]='Email error '+str(r.status_code)+': '+msg[:150]
+            return False
+        return True
+    except Exception as e:
+        print('EMAIL SEND FAILED:', str(e))
+        EMAIL_ERR[0]='Could not reach the email service: '+str(e)[:120]
+        return False
+
+TG_ERR=['']
+def tg_error():
+    return TG_ERR[0] or 'Could not send the Telegram code. Please check your Telegram Chat ID.'
+
+def send_telegram(chat_id,text):
+    TG_ERR[0]=''
+    token=os.getenv('TELEGRAM_BOT_TOKEN','').strip()
+    if not token:
+        TG_ERR[0]='Server problem: TELEGRAM_BOT_TOKEN is missing on Render (Environment settings).'
+        print('TELEGRAM SEND FAILED: TELEGRAM_BOT_TOKEN missing'); return False
+    if not chat_id:
+        TG_ERR[0]='Telegram Chat ID is empty.'; return False
+    try:
+        r=requests.post(f'https://api.telegram.org/bot{token}/sendMessage',
+            json={'chat_id':str(chat_id).strip(),'text':text}, timeout=15)
+        if r.status_code>=400:
+            print('TELEGRAM SEND FAILED:', r.status_code, r.text)
+            try: desc=r.json().get('description','')
+            except Exception: desc=''
+            if r.status_code==401:
+                TG_ERR[0]='Server problem: the bot token on Render is wrong (Unauthorized). Update TELEGRAM_BOT_TOKEN.'
+            elif r.status_code==403:
+                TG_ERR[0]='Telegram blocked it ('+desc+'). Open the bot in Telegram and press Start, then try again.'
+            elif 'chat not found' in desc.lower():
+                TG_ERR[0]='Telegram says: chat not found. Check your Chat ID (numbers only, from @userinfobot) and press Start on the bot.'
+            else:
+                TG_ERR[0]='Telegram error '+str(r.status_code)+': '+desc
+            return False
+        return True
+    except Exception as e:
+        print('TELEGRAM SEND FAILED:', str(e))
+        TG_ERR[0]='Could not reach Telegram from the server: '+str(e)
+        return False
+
+def otp_mode():
+    # telegram (default, current behaviour) | email | both
+    m=os.getenv('OTP_MODE','telegram').strip().lower()
+    # none = no OTP at all: the account is created verified and waits for admin approval
+    return m if m in ('telegram','email','both','none') else 'telegram'
+
+RATE={}
+def rate_ok(key,limit,window):
+    t=time.time()
+    xs=[x for x in RATE.get(key,[]) if t-x<window]
+    if len(xs)>=limit:
+        RATE[key]=xs
+        return False
+    xs.append(t); RATE[key]=xs
+    if len(RATE)>5000: RATE.clear()
+    return True
+
+def client_ip():
+    return (request.headers.get('X-Forwarded-For','').split(',')[0].strip() or request.remote_addr or '?')
+
+
+def send_otp_message(to,subject,body,telegram_chat_id=None):
+    mode=otp_mode()
+    if mode=='email':
+        return send_email(to,subject,body)
+    if mode=='both':
+        e=send_email(to,subject,body)
+        t=send_telegram(telegram_chat_id,subject+'\n\n'+body) if telegram_chat_id else False
+        return e or t
+    if not telegram_chat_id:
+        TG_ERR[0]='Telegram Chat ID is required.'
+        return False
+    return send_telegram(telegram_chat_id, subject+'\n\n'+body)
+
+def otp_error():
+    return email_error() if otp_mode() in ('email','both') else tg_error()
+
+def otp_sent_message():
+    return {'email':'Check your email (also the spam folder) for the verification code',
+            'both':'Check your email and Telegram for the verification code'}.get(otp_mode(),'Check your Telegram for the verification code')
+
+@app.get('/api/otp-mode')
+def api_otp_mode():
+    return jsonify(ok=True,mode=otp_mode())
+
+def admin_email(s,b):
+    # Notifies the admin on Telegram (ADMIN_TELEGRAM_CHAT_ID) and/or email (ADMIN_EMAIL), whichever is set.
+    tg=os.getenv('ADMIN_TELEGRAM_CHAT_ID','').strip()
+    if tg:
+        try: send_telegram(tg,s+'\n\n'+b)
+        except Exception as e: print('admin telegram notify failed:',e)
+    if os.getenv('ADMIN_EMAIL',''): send_email(os.getenv('ADMIN_EMAIL'),s,b)
+def key_ok(provided,env_name):
+    k=os.getenv(env_name,'').strip()
+    if not k or k=='CHANGE_ME': return False
+    return secrets.compare_digest((provided or '').encode(),k.encode())
+def admin_ok(): return key_ok(request.headers.get('X-Admin-Key',''),'ADMIN_API_KEY')
+
+# --- MT5 EA integration auth helpers ---
+def website_api_ok():
+    auth=request.headers.get('Authorization','')
+    token=auth.replace('Bearer ','').strip() if auth.startswith('Bearer ') else auth.strip()
+    return token!='' and key_ok(token,'WEBSITE_API_KEY')
+def bot_control_ok():
+    return key_ok(request.headers.get('X-Bot-Control-Key',''),'BOT_CONTROL_KEY')
+
+def otp(email,purpose):
+    code=f'{secrets.randbelow(1000000):06d}'; c=db(); c.execute('UPDATE otps SET used=1 WHERE email=? AND purpose=? AND used=0',(email,purpose)); c.execute('INSERT INTO otps(email,code_hash,expires_at,purpose) VALUES(?,?,?,?)',(email,h(code),(now()+timedelta(minutes=OTP_MINUTES)).isoformat(),purpose)); c.commit(); c.close(); return code
+
+@app.post('/api/register')
+def register():
+    if not rate_ok('reg:'+client_ip(),20,3600): return jsonify(ok=False,error='Too many attempts. Please try again later.'),429
+    d=request.get_json(force=True); req=['full_name','username','password','mt5_account','telegram_chat_id']+(['email'] if otp_mode() in ('email','both') else [])
+    if any(not str(d.get(k,'')).strip() for k in req): return jsonify(ok=False,error='Missing required field (Full name, Username, Password, MT5 account and Telegram Chat ID are required)'),400
+    telegram_chat_id=str(d.get('telegram_chat_id','')).strip()
+    if not telegram_chat_id.lstrip('-').isdigit(): return jsonify(ok=False,error='Telegram Chat ID must be a number (get it from @userinfobot)'),400
+    email=str(d.get('email','')).strip().lower() or ('tg'+telegram_chat_id+'@telegram.user'); c=db(); license_key=secrets.token_hex(16); trial_expiry=(now()+timedelta(days=3)).isoformat(); telegram_chat_id=str(d.get('telegram_chat_id','')).strip()
+    try:
+        c.execute('INSERT INTO users(full_name,email,phone,username,password_hash,mt5_account,created_at,license_key,membership,membership_expiry,telegram_chat_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)',(d['full_name'].strip(),email,d.get('phone','').strip(),d['username'].strip(),hash_pw(d['password']),str(d['mt5_account']),now().isoformat(),license_key,'FREE',trial_expiry,telegram_chat_id)); c.commit()
+    except psycopg2.IntegrityError:
+        c.close(); c=db()
+        ex=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
+        if not ex or ex.get('email_verified') or ex.get('username')!=d['username'].strip():
+            c.close(); return jsonify(ok=False,error='Email or username already exists'),409
+        # Earlier attempt failed before the code was delivered: let the user retry with updated details.
+        c.execute('UPDATE users SET full_name=?,phone=?,password_hash=?,mt5_account=?,telegram_chat_id=? WHERE email=?',(d['full_name'].strip(),d.get('phone','').strip(),hash_pw(d['password']),str(d['mt5_account']),telegram_chat_id,email)); c.commit()
+    if otp_mode()=='none':
+        c.execute('UPDATE users SET email_verified=1 WHERE email=?',(email,)); c.commit(); c.close()
+        admin_email('New GOLD MASTERS registration (awaiting your approval)',f'User: {d["full_name"]}\nEmail: {email}\nMT5: {d["mt5_account"]}\nStatus: PENDING')
+        return jsonify(ok=True,email=email,message='Registered. Your account is waiting for admin approval. You can log in after it is approved.')
+    c.close(); code=otp(email,'REGISTER'); sent=send_otp_message(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.',telegram_chat_id); admin_email('New GOLD MASTERS registration',f'User: {d["full_name"]}\nEmail: {email}\nMT5: {d["mt5_account"]}\nStatus: PENDING')
+    if not sent: return jsonify(ok=False,error=otp_error()),502
+    return jsonify(ok=True,email=email,message=otp_sent_message())
+
+@app.post('/api/verify-email')
+def verify():
+    if otp_mode()=='none': return jsonify(ok=False,error='Verification is not required. Wait for admin approval.'),400
+    d=request.get_json(force=True); email=d.get('email','').strip().lower(); code=d.get('code','').strip(); c=db(); r=c.execute("SELECT * FROM otps WHERE email=? AND purpose='REGISTER' AND used=0 ORDER BY id DESC LIMIT 1",(email,)).fetchone()
+    if not r or r['expires_at']<now().isoformat() or r['code_hash']!=h(code): c.close(); return jsonify(ok=False,error='Invalid or expired code'),400
+    c.execute('UPDATE otps SET used=1 WHERE id=?',(r['id'],)); c.execute('UPDATE users SET email_verified=1 WHERE email=?',(email,)); c.commit(); c.close(); admin_email('Email verified',f'{email} verified email and awaits admin approval.'); return jsonify(ok=True,status='PENDING')
+
+@app.post('/api/resend-otp')
+def resend_otp():
+    if otp_mode()=='none': return jsonify(ok=False,error='Verification is not required.'),400
+    d=request.get_json(force=True); email=d.get('email','').strip().lower()
+    if not rate_ok('rs:'+email,5,3600) or not rate_ok('rsip:'+client_ip(),30,3600): return jsonify(ok=False,error='Too many attempts. Please try again later.'),429
+    c=db(); u=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
+    if not u: c.close(); return jsonify(ok=False,error='User not found'),404
+    if u['email_verified']: c.close(); return jsonify(ok=False,error='Already verified'),400
+    c.close()
+    code=otp(email,'REGISTER')
+    sent=send_otp_message(email,'GOLD MASTERS verification code',f'Your verification code is: {code}\nExpires in {OTP_MINUTES} minutes.',u.get('telegram_chat_id'))
+    if not sent: return jsonify(ok=False,error=otp_error()),502
+    return jsonify(ok=True,email_sent=sent)
+
+@app.post('/api/login')
+def login():
+    if not rate_ok('login:'+client_ip(),60,600): return jsonify(ok=False,error='Too many attempts. Please try again later.'),429
+    d=request.get_json(force=True); ident=d.get('username_or_email','').strip(); pw=d.get('password',''); c=db(); u=c.execute('SELECT * FROM users WHERE username=? OR email=?',(ident,ident.lower())).fetchone()
+    if not u or not check_pw(pw,u['password_hash']): c.close(); return jsonify(ok=False,error='Invalid login'),401
+    if not u['email_verified']: c.close(); return jsonify(ok=False,error='Email not verified'),403
+    if u['status']!='APPROVED': c.close(); return jsonify(ok=False,status=u['status'],error='Admin approval required'),403
+    c.execute('UPDATE users SET last_login=? WHERE id=?',(now().isoformat(),u['id']))
+    if not u['password_hash'].startswith('pbkdf2$'): c.execute('UPDATE users SET password_hash=? WHERE id=?',(hash_pw(pw),u['id']))
+    tok=secrets.token_urlsafe(32); ts=now()
+    c.execute('DELETE FROM sessions WHERE expires_at<?',(ts.isoformat(),))
+    c.execute('INSERT INTO sessions(token_hash,user_id,created_at,expires_at) VALUES(?,?,?,?)',(h(tok),u['id'],ts.isoformat(),(ts+timedelta(days=30)).isoformat()))
+    c.commit(); c.close(); return jsonify(ok=True,token=tok,user={k:u[k] for k in ['id','full_name','email','membership','membership_expiry','status','mt5_account','wallet_balance','license_key']})
+
+def bearer_token():
+    a=request.headers.get('Authorization','')
+    return a[7:].strip() if a.startswith('Bearer ') else ''
+
+def auth_user():
+    tok=bearer_token()
+    if not tok: return None
+    c=db(); r=c.execute('SELECT u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token_hash=? AND s.expires_at>?',(h(tok),now().isoformat())).fetchone(); c.close()
+    return r
+
+@app.post('/api/logout')
+def logout():
+    tok=bearer_token()
+    if tok:
+        c=db(); c.execute('DELETE FROM sessions WHERE token_hash=?',(h(tok),)); c.commit(); c.close()
+    return jsonify(ok=True)
+
+@app.post('/api/payment-request')
+def payment():
+    u=auth_user()
+    if not u: return jsonify(ok=False,error='Please log in again'),401
+    d=request.get_json(force=True); email=u['email']; kind=d.get('kind','DEPOSIT').upper(); amount=float(d.get('amount',0))
+    if kind not in ('DEPOSIT','WITHDRAWAL') or amount<=0: return jsonify(ok=False,error='Invalid request'),400
+    c=db()
+    c.execute('INSERT INTO payments(user_id,kind,amount,currency,method,reference,destination,created_at) VALUES(?,?,?,?,?,?,?,?)',(u['id'],kind,amount,d.get('currency','USD'),d.get('method',''),d.get('reference',''),d.get('destination',''),now().isoformat())); c.commit(); c.close(); send_email(email,f'GOLD MASTERS {kind.title()} Request',f'Amount: {amount} {d.get("currency","USD")}\nStatus: PENDING ADMIN CONFIRMATION'); admin_email(f'New {kind}',f'User: {u["full_name"]}\nEmail: {email}\nAmount: {amount}'); return jsonify(ok=True,status='PENDING')
+
+PRICING={'MONTHLY':50,'SIX_MONTH':200,'YEARLY':400,'LIFETIME':1000}
+@app.get('/api/pricing')
+def pricing(): return jsonify(ok=True,pricing=PRICING,trial='3 days or 3 signals, whichever comes first',currency='USD')
+
+@app.get('/api/signals')
+def signals():
+    all_signals=rows("SELECT * FROM signals WHERE status='ACTIVE' ORDER BY id DESC LIMIT 100")
+    u=auth_user()
+    if not u:
+        return jsonify(ok=True,signals=[],trial=True,error='Login required to view signals. Free trial: 3 days or 3 signals.',pricing=PRICING)
+    c=db()
+    paid=u['membership'] in ('MONTHLY','SIX_MONTH','YEARLY','LIFETIME')
+    expired=False
+    if u['membership_expiry']:
+        try:
+            if datetime.fromisoformat(u['membership_expiry'])<now(): expired=True
+        except ValueError: pass
+    if paid and not expired:
+        c.close(); return jsonify(ok=True,signals=all_signals,trial=False)
+    if paid and expired:
+        c.close(); return jsonify(ok=True,signals=[],trial=True,error='Your membership has expired. Please renew to keep receiving signals.',pricing=PRICING)
+    if expired or u['signals_viewed_count']>=3:
+        c.close(); return jsonify(ok=True,signals=[],trial=True,error='Free trial ended (3 days or 3 signals). Upgrade to keep receiving signals.',pricing=PRICING)
+    remaining=3-u['signals_viewed_count']
+    c.execute('UPDATE users SET signals_viewed_count=signals_viewed_count+1 WHERE id=?',(u['id'],)); c.commit(); c.close()
+    return jsonify(ok=True,signals=all_signals[:1],trial=True,trial_signals_remaining=remaining-1,pricing=PRICING)
+
+@app.get('/api/market/symbols')
+def symbols():
+    return jsonify(ok=True,provider=os.getenv('MARKET_DATA_PROVIDER','none'),symbols=['XAUUSD','XAGUSD','EURUSD','GBPUSD','USDJPY','USDCHF','USDCAD','AUDUSD','NZDUSD','EURJPY','GBPJPY','BTCUSD','ETHUSD','NAS100','US30','SPX500','GER40'])
+
+def td_symbol(symbol):
+    m={
+      'XAUUSD':'XAU/USD','XAGUSD':'XAG/USD','EURUSD':'EUR/USD','GBPUSD':'GBP/USD',
+      'USDJPY':'USD/JPY','USDCHF':'USD/CHF','USDCAD':'USD/CAD','AUDUSD':'AUD/USD',
+      'NZDUSD':'NZD/USD','EURJPY':'EUR/JPY','GBPJPY':'GBP/JPY',
+      'BTCUSD':'BTC/USD','ETHUSD':'ETH/USD'
+    }
+    return m.get(symbol.upper(),symbol.upper())
+
+@app.get('/api/market/quote/<symbol>')
+def quote(symbol):
+    key=os.getenv('TWELVEDATA_API_KEY','').strip()
+    if not key:
+        return jsonify(ok=False,error='TWELVEDATA_API_KEY not configured',symbol=symbol.upper(),provider='Twelve Data'),503
+    try:
+        r=requests.get('https://api.twelvedata.com/quote',params={'symbol':td_symbol(symbol),'apikey':key},timeout=12)
+        data=r.json()
+        if data.get('status')=='error': return jsonify(ok=False,error=data.get('message','Market provider error'),provider='Twelve Data'),502
+        return jsonify(ok=True,provider='Twelve Data',symbol=symbol.upper(),quote={
+          'close':data.get('close'),'open':data.get('open'),'high':data.get('high'),'low':data.get('low'),
+          'previous_close':data.get('previous_close'),'change':data.get('change'),'percent_change':data.get('percent_change'),
+          'datetime':data.get('datetime'),'timestamp':data.get('timestamp')
+        })
+    except Exception as e:
+        return jsonify(ok=False,error='Live quote unavailable: '+str(e),provider='Twelve Data'),502
+
+@app.get('/api/market/history/<symbol>')
+def history(symbol):
+    key=os.getenv('TWELVEDATA_API_KEY','').strip(); interval=request.args.get('interval','5min')
+    if not key: return jsonify(ok=False,error='TWELVEDATA_API_KEY not configured',provider='Twelve Data'),503
+    try:
+        r=requests.get('https://api.twelvedata.com/time_series',params={'symbol':td_symbol(symbol),'interval':interval,'outputsize':200,'apikey':key},timeout=12)
+        data=r.json()
+        if data.get('status')=='error': return jsonify(ok=False,error=data.get('message','Market provider error')),502
+        return jsonify(ok=True,provider='Twelve Data',symbol=symbol.upper(),interval=interval,values=data.get('values',[]))
+    except Exception as e: return jsonify(ok=False,error='Live history unavailable: '+str(e)),502
+
+@app.get('/api/calendar')
+def calendar():
+    rows_mt5=rows('SELECT time,currency,country,event,importance,actual,forecast,previous,received_at FROM mt5_calendar ORDER BY time ASC LIMIT 200')
+    if rows_mt5:
+        return jsonify(ok=True,provider='MT5 Built-in Economic Calendar',events=rows_mt5)
+
+    key=os.getenv('TRADING_ECONOMICS_API_KEY','').strip()
+    if not key:
+        return jsonify(ok=False,error='MT5 calendar has no pushed events yet. Attach/run the GOLD MASTERS EA with PushCalendarToDashboard=true, or configure another calendar provider.',provider='MT5 Built-in Economic Calendar'),503
+    country=request.args.get('country','United States')
+    try:
+        r=requests.get('https://api.tradingeconomics.com/calendar/country/'+requests.utils.quote(country,safe=''),params={'c':'guest:guest' if key=='GUEST' else key,'f':'json'},timeout=15)
+        if r.status_code>=400: return jsonify(ok=False,error='Calendar provider returned HTTP '+str(r.status_code),provider='Trading Economics'),502
+        data=r.json()
+        return jsonify(ok=True,provider='Trading Economics',country=country,events=data[:100])
+    except Exception as e:
+        return jsonify(ok=False,error='Economic calendar unavailable: '+str(e),provider='Trading Economics'),502
+
+@app.post('/api/calendar/mt5')
+def calendar_mt5():
+    if not key_ok(request.headers.get('X-Calendar-Key',''),'MT5_CALENDAR_PUSH_KEY'):
+        return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True) or {}
+    events=d.get('events',[])
+    if not isinstance(events,list):
+        return jsonify(ok=False,error='events must be a list'),400
+    c=db()
+    c.execute('DELETE FROM mt5_calendar')
+    for e in events[:500]:
+        c.execute('INSERT INTO mt5_calendar(time,currency,country,event,importance,actual,forecast,previous,received_at) VALUES(?,?,?,?,?,?,?,?,?)',
+                  (str(e.get('time','')),str(e.get('currency','')),str(e.get('country','')),str(e.get('event','')),
+                   int(e.get('importance',0) or 0),float(e.get('actual',0) or 0),float(e.get('forecast',0) or 0),
+                   float(e.get('previous',0) or 0),now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True,provider='MT5 Built-in Economic Calendar',count=min(len(events),500))
+
+# ============================================================
+# MT5 EA INTEGRATION: heartbeat, trade log, remote bot control
+# These are the endpoints ROBOT_AI_AUTO_TRADING_BOT-14.mq5 calls
+# when UseWebsiteAPI / UseRemoteBotControl are enabled in its inputs.
+# ============================================================
+
+@app.post('/api/mt5/heartbeat')
+def mt5_heartbeat():
+    if not website_api_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True) or {}
+    account=str(d.get('mt5_account','')).strip()
+    if not account: return jsonify(ok=False,error='Missing mt5_account'),400
+    c=db()
+    u=c.execute('SELECT * FROM users WHERE mt5_account=?',(account,)).fetchone()
+    c.execute('''INSERT INTO bot_status(mt5_account,state,broker,server,symbol,balance,equity,free_margin,spread_points,positions,daily_stop,daily_profit_stop,drawdown_stop,updated_at)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 ON CONFLICT(mt5_account) DO UPDATE SET state=EXCLUDED.state,broker=EXCLUDED.broker,server=EXCLUDED.server,symbol=EXCLUDED.symbol,
+                   balance=EXCLUDED.balance,equity=EXCLUDED.equity,free_margin=EXCLUDED.free_margin,spread_points=EXCLUDED.spread_points,
+                   positions=EXCLUDED.positions,daily_stop=EXCLUDED.daily_stop,daily_profit_stop=EXCLUDED.daily_profit_stop,
+                   drawdown_stop=EXCLUDED.drawdown_stop,updated_at=EXCLUDED.updated_at''',
+              (account,d.get('state',''),d.get('broker',''),d.get('server',''),d.get('symbol',''),
+               float(d.get('balance',0) or 0),float(d.get('equity',0) or 0),float(d.get('free_margin',0) or 0),
+               float(d.get('spread_points',0) or 0),int(d.get('positions',0) or 0),
+               1 if d.get('daily_stop') else 0,1 if d.get('daily_profit_stop') else 0,1 if d.get('drawdown_stop') else 0,
+               now().isoformat()))
+    c.commit(); c.close()
+    # license flag the EA checks inside the heartbeat response ("license":true/false)
+    license_ok=True
+    if u:
+        license_ok = (u['status']=='APPROVED' and u['email_verified']==1)
+        if u['membership']!='LIFETIME' and u['membership_expiry']:
+            try:
+                if datetime.fromisoformat(u['membership_expiry'])<now(): license_ok=False
+            except ValueError: pass
+    return jsonify(ok=True,license=license_ok)
+
+@app.post('/api/mt5/trade')
+def mt5_trade():
+    if not website_api_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True) or {}
+    c=db()
+    c.execute('INSERT INTO bot_trades(mt5_account,event_type,side,ticket,symbol,price,lot,sl,tp,profit,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+              (str(d.get('mt5_account','')).strip(),str(d.get('type','')),str(d.get('side','')),
+               int(d.get('ticket',0) or 0),str(d.get('symbol','')),float(d.get('price',0) or 0),
+               float(d.get('lot',0) or 0),float(d.get('sl',0) or 0),float(d.get('tp',0) or 0),
+               float(d.get('profit',0) or 0),now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True)
+
+@app.get('/api/mt5/bot-control')
+def mt5_bot_control():
+    if not bot_control_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    account=request.args.get('account','').strip()
+    c=db()
+    row=c.execute('SELECT enabled FROM bot_control WHERE mt5_account=?',(account,)).fetchone() if account else None
+    c.close()
+    enabled = bool(row['enabled']) if row else True  # default ON if no explicit record
+    return jsonify(ok=True,enabled=enabled)
+
+@app.get('/api/admin/mt5-status')
+def admin_mt5_status():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    return jsonify(ok=True,bots=rows('SELECT * FROM bot_status ORDER BY updated_at DESC'))
+
+@app.get('/api/admin/mt5-trades')
+def admin_mt5_trades():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    return jsonify(ok=True,trades=rows('SELECT * FROM bot_trades ORDER BY id DESC LIMIT 200'))
+
+@app.post('/api/admin/bot-control')
+def admin_bot_control():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True); account=str(d.get('mt5_account','')).strip(); enabled=1 if d.get('enabled',True) else 0
+    if not account: return jsonify(ok=False,error='Missing mt5_account'),400
+    c=db()
+    c.execute('''INSERT INTO bot_control(mt5_account,enabled,updated_at) VALUES(?,?,?)
+                 ON CONFLICT(mt5_account) DO UPDATE SET enabled=EXCLUDED.enabled,updated_at=EXCLUDED.updated_at''',
+              (account,enabled,now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True,mt5_account=account,enabled=bool(enabled))
+
+@app.get('/api/admin/users')
+def admin_users():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    return jsonify(ok=True,users=rows('SELECT u.id,u.full_name,u.email,u.phone,u.telegram_chat_id,u.username,u.mt5_account,u.email_verified,u.status,u.membership,u.membership_expiry,u.created_at,u.last_login,u.wallet_balance,u.license_key,s.state AS bot_state,s.equity AS bot_equity,s.balance AS bot_balance,s.positions AS bot_positions,s.updated_at AS bot_seen,s.version AS bot_version,COALESCE(c.enabled,1) AS bot_enabled FROM users u LEFT JOIN bot_status s ON s.mt5_account=u.mt5_account LEFT JOIN bot_control c ON c.mt5_account=u.mt5_account ORDER BY u.id DESC'))
+
+@app.get('/api/admin/payments')
+def admin_payments():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    return jsonify(ok=True,payments=rows('SELECT payments.*,users.full_name,users.email,users.username,users.phone,users.telegram_chat_id FROM payments JOIN users ON users.id=payments.user_id ORDER BY payments.id DESC'))
+
+@app.post('/api/admin/user-status')
+def admin_status():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True); status=d.get('status','').upper(); email=d.get('email','').strip().lower()
+    if status not in ('APPROVED','REJECTED','SUSPENDED'): return jsonify(ok=False,error='Invalid status'),400
+    c=db(); c.execute('UPDATE users SET status=? WHERE email=?',(status,email)); c.commit(); c.close(); send_email(email,'GOLD MASTERS account update',f'Your account status is now: {status}'); return jsonify(ok=True,status=status)
+
+@app.post('/api/admin/user-mt5')
+def admin_user_mt5():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True,silent=True) or {}
+    email=str(d.get('email','')).strip().lower(); acc=str(d.get('mt5_account','')).strip()
+    if not acc.isdigit() or not (4<=len(acc)<=12): return jsonify(ok=False,error='MT5 account must be 4 to 12 digits (numbers only)'),400
+    c=db()
+    u=c.execute('SELECT id,mt5_account FROM users WHERE email=?',(email,)).fetchone()
+    if not u: c.close(); return jsonify(ok=False,error='User not found'),404
+    other=c.execute('SELECT email FROM users WHERE mt5_account=? AND email<>?',(acc,email)).fetchone()
+    if other: c.close(); return jsonify(ok=False,error='This MT5 account number is already used by another customer'),409
+    c.execute('UPDATE users SET mt5_account=? WHERE email=?',(acc,email)); c.commit(); c.close()
+    return jsonify(ok=True,old=u['mt5_account'],mt5_account=acc)
+
+@app.post('/api/admin/payment-status')
+def admin_payment():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True); pid=int(d['payment_id']); status=d.get('status','').upper(); c=db(); p=c.execute('SELECT payments.*,users.email,users.full_name FROM payments JOIN users ON users.id=payments.user_id WHERE payments.id=?',(pid,)).fetchone()
+    if not p: c.close(); return jsonify(ok=False,error='Payment not found'),404
+    if status not in ('APPROVED','REJECTED'): c.close(); return jsonify(ok=False,error='Invalid status'),400
+    if status=='APPROVED' and p['kind']=='WITHDRAWAL':
+        bal=c.execute('SELECT wallet_balance FROM users WHERE id=?',(p['user_id'],)).fetchone()['wallet_balance']
+        if bal<p['amount']: c.close(); return jsonify(ok=False,error='Insufficient wallet balance'),400
+    c.execute('UPDATE payments SET status=? WHERE id=?',(status,pid))
+    if status=='APPROVED': c.execute('UPDATE users SET wallet_balance=wallet_balance+? WHERE id=?',((p['amount'] if p['kind']=='DEPOSIT' else -p['amount']),p['user_id']))
+    c.commit(); c.close(); send_email(p['email'],'GOLD MASTERS request update',f'Your {p["kind"].lower()} request #{pid} is {status}.'); return jsonify(ok=True,status=status)
+
+@app.post('/api/admin/signal')
+def admin_signal():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True); direction=d.get('direction','WAIT').upper()
+    if direction not in ('BUY','SELL','WAIT'): return jsonify(ok=False,error='Invalid direction'),400
+    c=db(); c.execute('INSERT INTO signals(symbol,direction,entry,sl,tp1,tp2,confidence,reason,created_at) VALUES(?,?,?,?,?,?,?,?,?)',(d.get('symbol','XAUUSD').upper(),direction,d.get('entry'),d.get('sl'),d.get('tp1'),d.get('tp2'),d.get('confidence'),d.get('reason',''),now().isoformat())); c.commit(); c.close(); return jsonify(ok=True)
+
+@app.post('/api/admin/membership')
+def admin_membership():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True); email=d.get('email','').strip().lower(); membership=d.get('membership','').upper()
+    if membership not in ('FREE','MONTHLY','SIX_MONTH','YEARLY','LIFETIME'): return jsonify(ok=False,error='Invalid membership'),400
+    expiry=d.get('membership_expiry')
+    c=db(); u=c.execute('SELECT id,email FROM users WHERE LOWER(email)=? OR LOWER(username)=? OR telegram_chat_id=?',(email,email,email)).fetchone()
+    if not u: c.close(); return jsonify(ok=False,error='User not found (use username, Telegram ID or email)'),404
+    email=u['email']
+    c.execute('UPDATE users SET membership=?, membership_expiry=? WHERE email=?',(membership,expiry,email)); c.commit(); c.close()
+    send_email(email,'GOLD MASTERS membership update',f'Your membership is now: {membership}'+(f' (expires {expiry})' if expiry else ''))
+    return jsonify(ok=True,membership=membership,membership_expiry=expiry)
+
+@app.post('/api/admin/mt5-account')
+def admin_mt5_account():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True); email=d.get('email','').strip().lower(); mt5_account=str(d.get('mt5_account','')).strip()
+    if not mt5_account: return jsonify(ok=False,error='Missing mt5_account'),400
+    c=db(); u=c.execute('SELECT id FROM users WHERE email=?',(email,)).fetchone()
+    if not u: c.close(); return jsonify(ok=False,error='User not found'),404
+    c.execute('UPDATE users SET mt5_account=? WHERE email=?',(mt5_account,email)); c.commit(); c.close()
+    return jsonify(ok=True,email=email,mt5_account=mt5_account)
+
+@app.get('/api/mt5/verify')
+def mt5_verify():
+    account=request.args.get('account','').strip(); key=request.args.get('key','').strip()
+    if not account or not key: return jsonify(ok=False,error='Missing account or key'),400
+    c=db(); u=c.execute('SELECT * FROM users WHERE mt5_account=? AND license_key=?',(account,key)).fetchone()
+    ctl=c.execute('SELECT enabled FROM bot_control WHERE mt5_account=?',(account,)).fetchone() if u else None
+    c.close()
+    if not u: return jsonify(ok=False,error='Invalid account or license key'),401
+    enabled=bool(ctl['enabled']) if ctl else True   # admin can pause one customer's EA; default ON
+    active=(u['status']=='APPROVED' and u['email_verified']==1)
+    expired=False
+    if u['membership']!='LIFETIME' and u['membership_expiry']:
+        try:
+            if datetime.fromisoformat(u['membership_expiry'])<now(): expired=True
+        except ValueError: pass
+    if expired: active=False
+    auto_allowed=active and u['membership'] in ('YEARLY','LIFETIME')
+    return jsonify(ok=True,active=active,expired=expired,status=u['status'],membership=u['membership'],
+                   membership_expiry=u['membership_expiry'],wallet_balance=u['wallet_balance'],auto_allowed=auto_allowed,enabled=enabled,
+                   latest_version=os.getenv('EA_LATEST_VERSION','').strip(),download_url=os.getenv('EA_DOWNLOAD_URL','').strip())
+
+
+# ---- EA <-> website link: every call is authenticated with the customer's own MT5 account + license key ----
+def ea_auth(d):
+    account=str(d.get('account','')).strip(); key=str(d.get('key','')).strip()
+    if not account or not key: return None
+    c=db(); u=c.execute('SELECT * FROM users WHERE mt5_account=? AND license_key=?',(account,key)).fetchone(); c.close()
+    return u
+
+@app.post('/api/ea/report')
+def ea_report():
+    d=request.get_json(force=True,silent=True) or {}
+    u=ea_auth(d)
+    if not u: return jsonify(ok=False,error='Invalid account or license key'),401
+    account=str(d.get('account')).strip()
+    def num(k): 
+        try: return float(d.get(k,0) or 0)
+        except (TypeError,ValueError): return 0.0
+    c=db()
+    c.execute('''INSERT INTO bot_status(mt5_account,state,broker,server,symbol,balance,equity,free_margin,spread_points,positions,daily_stop,daily_profit_stop,drawdown_stop,updated_at,version)
+                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 ON CONFLICT(mt5_account) DO UPDATE SET state=EXCLUDED.state,broker=EXCLUDED.broker,server=EXCLUDED.server,symbol=EXCLUDED.symbol,
+                   balance=EXCLUDED.balance,equity=EXCLUDED.equity,free_margin=EXCLUDED.free_margin,spread_points=EXCLUDED.spread_points,
+                   positions=EXCLUDED.positions,daily_stop=EXCLUDED.daily_stop,daily_profit_stop=EXCLUDED.daily_profit_stop,
+                   drawdown_stop=EXCLUDED.drawdown_stop,updated_at=EXCLUDED.updated_at,version=EXCLUDED.version''',
+              (account,str(d.get('state',''))[:80],str(d.get('broker',''))[:80],str(d.get('server',''))[:80],str(d.get('symbol',''))[:30],
+               num('balance'),num('equity'),num('free_margin'),num('spread_points'),int(num('positions')),
+               1 if d.get('daily_stop') else 0,0,0,now().isoformat(),str(d.get('version',''))[:20]))
+    ctl=c.execute('SELECT enabled FROM bot_control WHERE mt5_account=?',(account,)).fetchone()
+    c.commit(); c.close()
+    return jsonify(ok=True,enabled=(bool(ctl['enabled']) if ctl else True))
+
+@app.post('/api/ea/trade')
+def ea_trade():
+    d=request.get_json(force=True,silent=True) or {}
+    u=ea_auth(d)
+    if not u: return jsonify(ok=False,error='Invalid account or license key'),401
+    def num(k):
+        try: return float(d.get(k,0) or 0)
+        except (TypeError,ValueError): return 0.0
+    c=db()
+    c.execute('INSERT INTO bot_trades(mt5_account,event_type,side,ticket,symbol,price,lot,sl,tp,profit,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+              (str(d.get('account')).strip(),str(d.get('type',''))[:30],str(d.get('side',''))[:10],int(num('ticket')),
+               str(d.get('symbol',''))[:30],num('price'),num('lot'),num('sl'),num('tp'),num('profit'),now().isoformat()))
+    c.commit(); c.close()
+    return jsonify(ok=True)
+
+
+# ---- GOLD TITAN EA -> website Signals page (owner's EA only; protected by a secret key in Render) ----
+def signal_key_ok():
+    k=(os.getenv('SIGNAL_API_KEY','') or os.getenv('WEBSITE_API_KEY','')).strip()
+    if not k or k=='CHANGE_ME': return False
+    auth=request.headers.get('Authorization','')
+    token=auth.replace('Bearer ','').strip() if auth.startswith('Bearer ') else auth.strip()
+    return secrets.compare_digest(token,k)
+
+@app.post('/api/ea/signal')
+def ea_signal():
+    if not signal_key_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True,silent=True) or {}
+    direction=str(d.get('direction','')).upper()
+    if direction not in ('BUY','SELL'): return jsonify(ok=False,error='Invalid direction'),400
+    try:
+        entry,sl,tp1,tp2,tp3=[float(d.get(k)) for k in ('entry','sl','tp1','tp2','tp3')]
+        conf=float(d.get('confidence',0) or 0)
+    except (TypeError,ValueError): return jsonify(ok=False,error='Invalid numbers'),400
+    ok=(sl<entry<tp1<tp2<tp3) if direction=='BUY' else (tp3<tp2<tp1<entry<sl)
+    if not ok: return jsonify(ok=False,error='Price levels are not consistent'),400
+    symbol=''.join(ch for ch in str(d.get('symbol','XAUUSD')).upper() if ch.isalnum() or ch in '._#')[:20] or 'XAUUSD'
+    tf=str(d.get('timeframe',''))[:6]; bar=str(d.get('bar_time',''))[:20]; reason=str(d.get('reason',''))[:200]
+    key=symbol+'|'+tf+'|'+bar+'|'+direction
+    c=db()
+    if bar and c.execute('SELECT id FROM signals WHERE dedupe_key=?',(key,)).fetchone():
+        c.close(); return jsonify(ok=True,duplicate=True)
+    # EA signals stop being "ACTIVE" after 24 hours
+    c.execute("UPDATE signals SET status='EXPIRED' WHERE status='ACTIVE' AND dedupe_key IS NOT NULL AND created_at<?",((now()-timedelta(hours=24)).isoformat(),))
+    c.execute('INSERT INTO signals(symbol,direction,entry,sl,tp1,tp2,tp3,confidence,reason,created_at,timeframe,dedupe_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)',
+              (symbol,direction,entry,sl,tp1,tp2,tp3,conf,reason,now().isoformat(),tf,(key if bar else None)))
+    c.commit(); c.close()
+    return jsonify(ok=True)
+
+
+# ---------------- Customer EA download (stored in PostgreSQL, never in GitHub) ----------------
+def latest_ea(with_data=False):
+    cols='id,version,filename,size,uploaded_at'+(',data' if with_data else '')
+    c=db(); r=c.execute('SELECT '+cols+' FROM ea_files ORDER BY id DESC LIMIT 1').fetchone(); c.close()
+    return r
+
+def ea_user():
+    """Logged-in, email-verified and admin-APPROVED users only (payment NOT required)."""
+    u=auth_user()
+    if not u: return None,(jsonify(ok=False,error='Please log in again'),401)
+    if not u['email_verified'] or u['status']!='APPROVED':
+        return None,(jsonify(ok=False,error='Your account must be approved by the admin before you can download the EA'),403)
+    return u,None
+
+@app.get('/api/ea/info')
+def ea_info():
+    u,err=ea_user()
+    if err: return err
+    e=latest_ea()
+    if not e: return jsonify(ok=True,available=False)
+    return jsonify(ok=True,available=True,version=e['version'],filename=e['filename'],size=e['size'],uploaded_at=e['uploaded_at'])
+
+@app.get('/api/ea/download')
+def ea_download():
+    if not rate_ok('eadl:'+client_ip(),30,3600): return jsonify(ok=False,error='Too many downloads. Please try again later.'),429
+    u,err=ea_user()
+    if err: return err
+    e=latest_ea(True)
+    if not e: return jsonify(ok=False,error='The EA file has not been uploaded yet. Please contact support.'),404
+    c=db(); c.execute('INSERT INTO ea_downloads(user_id,ea_id,version,ip,downloaded_at) VALUES(?,?,?,?,?)',(u['id'],e['id'],e['version'],client_ip(),now().isoformat())); c.commit(); c.close()
+    return Response(bytes(e['data']),mimetype='application/octet-stream',headers={'Content-Disposition':'attachment; filename="'+e['filename']+'"','Cache-Control':'no-store'})
+
+@app.post('/api/admin/ea-upload')
+def admin_ea_upload():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    f=request.files.get('file'); version=(request.form.get('version') or '').strip()[:20]
+    if not f or not f.filename: return jsonify(ok=False,error='Choose the compiled .ex5 file'),400
+    if not version: return jsonify(ok=False,error='Enter a version number, e.g. 2.4'),400
+    name=os.path.basename(f.filename).replace('"','').replace(' ','_')
+    if not name.lower().endswith('.ex5'):
+        return jsonify(ok=False,error='Only the compiled .ex5 file is allowed. Never upload the .mq5 source file.'),400
+    data=f.read()
+    if len(data)<1024: return jsonify(ok=False,error='File looks empty or invalid'),400
+    c=db(); c.execute('INSERT INTO ea_files(version,filename,data,size,uploaded_at) VALUES(?,?,?,?,?)',(version,name,psycopg2.Binary(data),len(data),now().isoformat())); c.commit(); c.close()
+    return jsonify(ok=True,version=version,filename=name,size=len(data))
+
+@app.get('/api/admin/ea-info')
+def admin_ea_info():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    e=latest_ea()
+    c=db(); n=c.execute('SELECT COUNT(*) AS n FROM ea_downloads').fetchone()['n']; c.close()
+    return jsonify(ok=True,available=bool(e),ea=e,downloads=n)
+
+@app.errorhandler(413)
+def too_big(e): return jsonify(ok=False,error='File too large (max 10 MB)'),413
+
+
+# ---------------- In-app high-impact news alerts ----------------
+NEWS_CACHE={'t':0,'ev':[]}
+def parse_event_time(s):
+    s=str(s or '').strip()
+    if not s: return None
+    if s.isdigit():
+        try: return datetime.fromtimestamp(int(s),timezone.utc)
+        except Exception: return None
+    for fmt in ('%Y.%m.%d %H:%M:%S','%Y.%m.%d %H:%M','%Y-%m-%d %H:%M:%S','%Y-%m-%d %H:%M'):
+        try: return datetime.strptime(s,fmt).replace(tzinfo=timezone.utc)
+        except Exception: pass
+    try:
+        d=datetime.fromisoformat(s.replace('Z','+00:00'))
+        return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+    except Exception: return None
+
+def news_events():
+    """High-impact USD events from the MT5 calendar table, else Trading Economics (cached 5 min)."""
+    if time.time()-NEWS_CACHE['t']<300: return NEWS_CACHE['ev']
+    out=[]
+    try:
+        for r in rows("SELECT time,currency,event,importance,actual,forecast,previous FROM mt5_calendar WHERE importance>=3 AND (currency='USD' OR currency='')"):
+            t=parse_event_time(r['time'])
+            if t: out.append({'event':r['event'],'time':t,'actual':r['actual'],'forecast':r['forecast'],'previous':r['previous']})
+        if not out:
+            key=os.getenv('TRADING_ECONOMICS_API_KEY','').strip()
+            if key:
+                r=requests.get('https://api.tradingeconomics.com/calendar/country/United%20States',params={'c':'guest:guest' if key=='GUEST' else key,'f':'json'},timeout=15)
+                if r.status_code<400:
+                    for x in r.json():
+                        if int(x.get('Importance') or 0)>=3:
+                            t=parse_event_time(x.get('Date'))
+                            if t: out.append({'event':x.get('Event',''),'time':t,'actual':x.get('Actual'),'forecast':x.get('Forecast'),'previous':x.get('Previous')})
+    except Exception as e:
+        print('news_events error:',e)
+    NEWS_CACHE['t']=time.time(); NEWS_CACHE['ev']=out
+    return out
+
+@app.get('/api/news/alerts')
+def news_alerts():
+    n=now(); res=[]
+    for e in news_events():
+        mins=round((e['time']-n).total_seconds()/60)
+        if -15<=mins<=60:
+            res.append({'event':e['event'],'time':e['time'].isoformat(),'minutes':mins,'status':'upcoming' if mins>0 else 'released','actual':e['actual'],'forecast':e['forecast'],'previous':e['previous']})
+    res.sort(key=lambda x:x['minutes'])
+    return jsonify(ok=True,alerts=res[:5])
+
+
+# ---------------- Contact form -> Telegram (admin) ----------------
+@app.post('/api/contact')
+def contact():
+    if not rate_ok('contact:'+client_ip(),5,3600): return jsonify(ok=False,error='Too many messages. Please try again later.'),429
+    d=request.get_json(force=True) or {}
+    name=str(d.get('name','')).strip()[:80]; tg=str(d.get('telegram','')).strip()[:60]
+    subj=str(d.get('subject','')).strip()[:100]; msg_=str(d.get('message','')).strip()[:1500]
+    if not name or not tg or not msg_: return jsonify(ok=False,error='Please enter your name, Telegram username and message'),400
+    chat=os.getenv('ADMIN_TELEGRAM_CHAT_ID','').strip()
+    if not chat: return jsonify(ok=False,error='The form is not available right now. Please use the Telegram support button.'),503
+    ok=send_telegram(chat,'New support message\nName: '+name+'\nTelegram: '+tg+'\nSubject: '+(subj or '-')+'\n\n'+msg_)
+    if not ok: return jsonify(ok=False,error='Could not deliver the message. Please use the Telegram support button.'),502
+    return jsonify(ok=True,message='Message sent. We will reply to you on Telegram.')
+
+@app.get('/api/health')
+def health(): return jsonify(ok=True,service='GOLD MASTERS API',time=now().isoformat())
+
+@app.get('/api/admin/db-check')
+def admin_db_check():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    if not DATABASE_URL:
+        return jsonify(ok=False,error='DATABASE_URL is not set on this server. Add it in your host\'s environment variables.'),500
+    try:
+        c = db()
+        version = c.execute('SELECT version()').fetchone()['version']
+        user_count = c.execute('SELECT COUNT(*) AS n FROM users').fetchone()['n']
+        payment_count = c.execute('SELECT COUNT(*) AS n FROM payments').fetchone()['n']
+        signal_count = c.execute('SELECT COUNT(*) AS n FROM signals').fetchone()['n']
+        c.close()
+    except Exception as e:
+        return jsonify(ok=False,error='Could not connect/query the database: '+str(e)),500
+    return jsonify(ok=True,connected=True,postgres_version=version,
+                   users=user_count,payments=payment_count,signals=signal_count)
+
+init()
+if __name__=='__main__': app.run(host='0.0.0.0',port=int(os.getenv('PORT','8000')))
