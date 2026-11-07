@@ -42,7 +42,8 @@ async function renderEaBox(lb){
   d=document.createElement('div');d.id='eaBox';d.style.marginTop='14px';lb.appendChild(d);
   let i=await req('/api/ea/info');
   if(!i.available){d.innerHTML='<b>Download EA</b><br><span class="muted">The EA file is not available yet. Please check back soon.</span>';return}
-  d.innerHTML='<b>Download EA (v'+i.version+')</b> <span class="muted">'+fmtSize(i.size)+'</span><br><button onclick="downloadEA()">Download EA v'+i.version+'</button>'+
+  let upd=i.update_available?'<div style="background:#3a2d00;border:1px solid #d4a800;color:#ffe08a;border-radius:8px;padding:8px 10px;margin:8px 0">⚠️ <b>Update available:</b> v'+i.version+(i.your_version?' (you are using v'+i.your_version+')':'')+'. Download it below, replace the old file in MQL5/Experts and restart MT5.</div>':(i.your_version?'<div class="muted" style="margin:6px 0">✅ You are using the latest version (v'+i.your_version+').</div>':'');
+  d.innerHTML=upd+'<b>Download EA (v'+i.version+')</b> <span class="muted">'+fmtSize(i.size)+'</span><br><button onclick="downloadEA()">Download EA v'+i.version+'</button>'+
    '<ol class="muted" style="font-size:13px;line-height:1.6;padding-left:18px"><li>Save the file, then in MT5 open <b>File &rarr; Open Data Folder &rarr; MQL5 &rarr; Experts</b> and paste it there.</li><li>Restart MT5 (or right-click Experts in the Navigator &rarr; Refresh).</li><li><b>Tools &rarr; Options &rarr; Expert Advisors</b>: tick <i>Allow WebRequest</i> and add this website\'s API URL.</li><li>Drag the EA onto an XAUUSD chart and paste your License Key into the <code>LicenseKey</code> input.</li></ol>'+
    '<p class="muted" style="font-size:12px">The EA only works with your License Key on your own MT5 account. Do not share the file or key.</p>';
  }catch(e){}
@@ -102,3 +103,15 @@ function enableNewsAlerts(){
  Notification.requestPermission().then(p=>{msg(p==='granted'?'News notifications enabled':'Notifications blocked. The banner in the app still shows news.');checkNews()})
 }
 checkNews();setInterval(checkNews,60000);
+
+// ---------- Forgot password (OTP via Telegram) ----------
+async function sendResetCode(){
+ let id=$('rstId').value.trim();if(!id){$('rstStatus').textContent='Enter your username or Telegram ID.';return}
+ $('rstStatus').textContent='Sending…';
+ try{let r=await fetch(api()+'/api/forgot-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({identifier:id})});let x=await r.json();if(!r.ok)throw new Error(x.error||'Failed');$('rstStatus').textContent=x.message}catch(e){$('rstStatus').textContent=e.message}
+}
+async function resetPassword(){
+ let b={identifier:$('rstId').value.trim(),code:$('rstCode').value.trim(),new_password:$('rstPw').value};
+ if(!b.identifier||!b.code||!b.new_password){$('rstStatus').textContent='Enter your username, the code and a new password.';return}
+ try{let r=await fetch(api()+'/api/reset-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let x=await r.json();if(!r.ok)throw new Error(x.error||'Failed');$('rstStatus').textContent=x.message;$('rstCode').value='';$('rstPw').value='';msg('Password changed');setTimeout(()=>showAuth('login'),1200)}catch(e){$('rstStatus').textContent=e.message}
+}
