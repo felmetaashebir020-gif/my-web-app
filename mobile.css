@@ -47,3 +47,8 @@ html{-webkit-text-size-adjust:100%}
   nav{flex-wrap:nowrap!important}
   nav button{font-size:14px!important;min-height:38px!important;padding:6px 12px!important;margin:0!important}
 }
+.priceBox ul{list-style:none;text-align:left;font-size:13px;padding:0;margin:8px 0 0;line-height:1.5}
+.priceBox ul li:before{content:"✓ ";color:#d4a800}
+.priceBox ul li.autoYes{color:#3ddc84;font-weight:bold}.priceBox ul li.autoYes:before{content:""}
+.priceBox ul li.autoNo{color:#9aa0a6}.priceBox ul li.autoNo:before{content:""}
+.priceBox.silver{border-color:#c0c0c0}.priceBox.gold{border-color:#d4a800}.priceBox.platinum{border-color:#5b8def}.priceBox.diamond{border-color:#a56cff}.priceBox.bronze{border-color:#cd7f32}
