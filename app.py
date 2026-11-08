@@ -1,6 +1,6 @@
 import os, secrets, hashlib, smtplib, requests
 import psycopg2, psycopg2.extras
-import socket, time, json
+import socket, time, json, re
 
 # --- Force IPv4 for outbound connections (fixes "Network is unreachable" on Render) ---
 _orig_getaddrinfo = socket.getaddrinfo
@@ -28,6 +28,8 @@ class PgCursorWrapper:
         r = self._cur.fetchone(); return dict(r) if r is not None else None
     def fetchall(self):
         return [dict(r) for r in self._cur.fetchall()]
+    @property
+    def rowcount(self): return self._cur.rowcount
 
 class PgConn:
     def __init__(self):
@@ -76,6 +78,7 @@ CREATE TABLE IF NOT EXISTS mt5_calendar(id SERIAL PRIMARY KEY,time TEXT,currency
 CREATE TABLE IF NOT EXISTS bot_status(mt5_account TEXT PRIMARY KEY,state TEXT,broker TEXT,server TEXT,symbol TEXT,balance REAL,equity REAL,free_margin REAL,spread_points REAL,positions INTEGER,daily_stop INTEGER DEFAULT 0,daily_profit_stop INTEGER DEFAULT 0,drawdown_stop INTEGER DEFAULT 0,updated_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS bot_trades(id SERIAL PRIMARY KEY,mt5_account TEXT,event_type TEXT,side TEXT,ticket BIGINT,symbol TEXT,price REAL,lot REAL,sl REAL,tp REAL,profit REAL,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS bot_control(mt5_account TEXT PRIMARY KEY,enabled INTEGER DEFAULT 1,updated_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS bot_mode(mt5_account TEXT PRIMARY KEY,mode TEXT NOT NULL DEFAULT 'MANUAL',seq INTEGER NOT NULL DEFAULT 0,updated_at TEXT NOT NULL);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS license_key TEXT;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS signals_viewed_count INTEGER DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_chat_id TEXT;
@@ -86,6 +89,15 @@ ALTER TABLE signals ADD COLUMN IF NOT EXISTS timeframe TEXT;
 ALTER TABLE signals ADD COLUMN IF NOT EXISTS dedupe_key TEXT;
 CREATE UNIQUE INDEX IF NOT EXISTS idx_signals_dedupe ON signals(dedupe_key);
 CREATE TABLE IF NOT EXISTS ea_files(id SERIAL PRIMARY KEY,version TEXT NOT NULL,filename TEXT NOT NULL,data BYTEA NOT NULL,size INTEGER NOT NULL,uploaded_at TEXT NOT NULL);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referral_code TEXT;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS referred_by INTEGER;
+ALTER TABLE users ADD COLUMN IF NOT EXISTS commission_credit REAL DEFAULT 0;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_refcode ON users(referral_code);
+CREATE TABLE IF NOT EXISTS orders(id SERIAL PRIMARY KEY,user_id INTEGER NOT NULL,plan TEXT NOT NULL,price REAL NOT NULL,wallet_amount REAL NOT NULL DEFAULT 0,commission_used REAL NOT NULL DEFAULT 0,crypto_amount REAL NOT NULL DEFAULT 0,network TEXT,txid TEXT,status TEXT NOT NULL DEFAULT 'PENDING',created_at TEXT NOT NULL,decided_at TEXT);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_orders_txid ON orders(txid) WHERE txid IS NOT NULL;
+CREATE TABLE IF NOT EXISTS commissions(id SERIAL PRIMARY KEY,order_id INTEGER NOT NULL UNIQUE,referrer_id INTEGER NOT NULL,referred_id INTEGER NOT NULL,plan TEXT NOT NULL,basis REAL NOT NULL,rate REAL NOT NULL,amount REAL NOT NULL,status TEXT NOT NULL DEFAULT 'PENDING',created_at TEXT NOT NULL,decided_at TEXT);
+CREATE TABLE IF NOT EXISTS wallet_ledger(id SERIAL PRIMARY KEY,user_id INTEGER NOT NULL,kind TEXT NOT NULL,amount REAL NOT NULL,balance_after REAL NOT NULL,ref TEXT,note TEXT,created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS admin_audit(id SERIAL PRIMARY KEY,action TEXT NOT NULL,detail TEXT,created_at TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS ea_downloads(id SERIAL PRIMARY KEY,user_id INTEGER NOT NULL,ea_id INTEGER NOT NULL,version TEXT,ip TEXT,downloaded_at TEXT NOT NULL);
 '''); c.commit(); c.close()
     except Exception as e:
@@ -236,6 +248,9 @@ def register():
     if not rate_ok('reg:'+client_ip(),20,3600): return jsonify(ok=False,error='Too many attempts. Please try again later.'),429
     d=request.get_json(force=True); req=['full_name','username','password','mt5_account','telegram_chat_id']+(['email'] if otp_mode() in ('email','both') else [])
     if any(not str(d.get(k,'')).strip() for k in req): return jsonify(ok=False,error='Missing required field (Full name, Username, Password, MT5 account and Telegram Chat ID are required)'),400
+    for k_ in ('full_name','username','phone','email','ref'):
+        if re.search(r'[<>"`\\\']',str(d.get(k_,'')).replace("'",'') if k_=='full_name' else str(d.get(k_,''))): return jsonify(ok=False,error='Invalid characters in '+k_),400
+    if not re.fullmatch(r'[A-Za-z0-9_.@-]{3,40}',str(d.get('username','')).strip()): return jsonify(ok=False,error='Username: 3-40 letters, numbers, . _ - only'),400
     telegram_chat_id=str(d.get('telegram_chat_id','')).strip()
     if not telegram_chat_id.lstrip('-').isdigit(): return jsonify(ok=False,error='Telegram Chat ID must be a number (get it from @userinfobot)'),400
     email=str(d.get('email','')).strip().lower() or ('tg'+telegram_chat_id+'@telegram.user'); c=db(); license_key=secrets.token_hex(16); trial_expiry=(now()+timedelta(days=3)).isoformat(); telegram_chat_id=str(d.get('telegram_chat_id','')).strip()
@@ -248,6 +263,11 @@ def register():
             c.close(); return jsonify(ok=False,error='Email or username already exists'),409
         # Earlier attempt failed before the code was delivered: let the user retry with updated details.
         c.execute('UPDATE users SET full_name=?,phone=?,password_hash=?,mt5_account=?,telegram_chat_id=? WHERE email=?',(d['full_name'].strip(),d.get('phone','').strip(),hash_pw(d['password']),str(d['mt5_account']),telegram_chat_id,email)); c.commit()
+    refc=str(d.get('ref','')).strip().upper()[:20]
+    if refc:
+        rr=c.execute('SELECT id,telegram_chat_id,mt5_account FROM users WHERE referral_code=?',(refc,)).fetchone()
+        if rr and str(rr['telegram_chat_id'] or '')!=telegram_chat_id and str(rr['mt5_account'] or '')!=str(d['mt5_account']):   # no self-referral
+            c.execute('UPDATE users SET referred_by=? WHERE email=? AND referred_by IS NULL',(rr['id'],email)); c.commit()
     if otp_mode()=='none':
         c.execute('UPDATE users SET email_verified=1 WHERE email=?',(email,)); c.commit(); c.close()
         admin_email('New GOLD MASTERS registration (awaiting your approval)',f'User: {d["full_name"]}\nEmail: {email}\nMT5: {d["mt5_account"]}\nStatus: PENDING')
@@ -314,12 +334,32 @@ def payment():
     if not u: return jsonify(ok=False,error='Please log in again'),401
     d=request.get_json(force=True); email=u['email']; kind=d.get('kind','DEPOSIT').upper(); amount=float(d.get('amount',0))
     if kind not in ('DEPOSIT','WITHDRAWAL') or amount<=0: return jsonify(ok=False,error='Invalid request'),400
-    c=db()
+    c=db(); ref_=str(d.get('reference','')).strip()
+    if kind=='DEPOSIT' and ref_ and (c.execute('SELECT 1 AS x FROM payments WHERE LOWER(reference)=? LIMIT 1',(ref_.lower(),)).fetchone() or c.execute('SELECT 1 AS x FROM orders WHERE LOWER(txid)=? LIMIT 1',(ref_.lower(),)).fetchone()):
+        c.close(); return jsonify(ok=False,error='This transaction ID was already submitted'),409
     c.execute('INSERT INTO payments(user_id,kind,amount,currency,method,reference,destination,created_at) VALUES(?,?,?,?,?,?,?,?)',(u['id'],kind,amount,d.get('currency','USD'),d.get('method',''),d.get('reference',''),d.get('destination',''),now().isoformat())); c.commit(); c.close(); send_email(email,f'GOLD MASTERS {kind.title()} Request',f'Amount: {amount} {d.get("currency","USD")}\nStatus: PENDING ADMIN CONFIRMATION'); admin_email(f'New {kind}',f'User: {u["full_name"]}\nEmail: {email}\nAmount: {amount}'); return jsonify(ok=True,status='PENDING')
 
-PRICING={'MONTHLY':50,'SIX_MONTH':200,'YEARLY':400,'LIFETIME':1000}
+# Membership levels (days=None means lifetime). Old plan names stay valid so existing members keep working.
+PLAN_INFO=[
+ ('BRONZE','Bronze',50,30,['Daily gold signals','Entry price, SL & TP','Basic gold market analysis']),
+ ('SILVER','Silver',200,90,['All Bronze benefits','Advanced market analysis','Signal history','Weekly market reports']),
+ ('GOLD','Gold',350,180,['All Silver benefits','Sniper entry signals','Quick entry signals','Multi-timeframe analysis','Trading education']),
+ ('PLATINUM','Platinum',500,365,['All Gold benefits','VIP GOLD group access','Priority support','Premium market reports','Referral partner eligibility','Live trading education']),
+ ('DIAMOND','Diamond',1500,None,['All Platinum benefits','Lifetime membership','VIP GOLD & VIP DIAMOND access','Lifetime educational content','Referral partner eligibility','Exclusive member benefits'])]
+PRICING={c:pr for c,_,pr,_,_ in PLAN_INFO}
+PLAN_DAYS={c:d for c,_,_,d,_ in PLAN_INFO}
+PLAN_DAYS.update({'MONTHLY':30,'SIX_MONTH':180,'YEARLY':365,'LIFETIME':None})
+PAID_PLANS=tuple(PLAN_DAYS)
+LIFETIME_PLANS=tuple(k for k,v in PLAN_DAYS.items() if v is None)
+# Which plans may use AUTO trading. Change on Render with the AUTO_PLANS variable, no code change needed.
+AUTO_PLANS=tuple(x.strip().upper() for x in os.getenv('AUTO_PLANS','GOLD,PLATINUM,DIAMOND,YEARLY,LIFETIME').split(',') if x.strip())
+def auto_plan_text():
+    n=[nm for c,nm,_,_,_ in PLAN_INFO if c in AUTO_PLANS]
+    return ', '.join(n) if n else 'a higher plan'
 @app.get('/api/pricing')
-def pricing(): return jsonify(ok=True,pricing=PRICING,trial='3 days or 3 signals, whichever comes first',currency='USD')
+def pricing():
+    plans=[{'code':c,'name':nm,'price':pr,'duration':('Lifetime' if d is None else str(d)+' days'),'features':f,'auto':c in AUTO_PLANS} for c,nm,pr,d,f in PLAN_INFO]
+    return jsonify(ok=True,pricing=PRICING,plans=plans,trial='3 days or 3 signals, whichever comes first',currency='USD')
 
 @app.get('/api/signals')
 def signals():
@@ -328,7 +368,7 @@ def signals():
     if not u:
         return jsonify(ok=True,signals=[],trial=True,error='Login required to view signals. Free trial: 3 days or 3 signals.',pricing=PRICING)
     c=db()
-    paid=u['membership'] in ('MONTHLY','SIX_MONTH','YEARLY','LIFETIME')
+    paid=u['membership'] in PAID_PLANS
     expired=False
     if u['membership_expiry']:
         try:
@@ -396,7 +436,7 @@ def calendar():
         return jsonify(ok=False,error='MT5 calendar has no pushed events yet. Attach/run the GOLD MASTERS EA with PushCalendarToDashboard=true, or configure another calendar provider.',provider='MT5 Built-in Economic Calendar'),503
     country=request.args.get('country','United States')
     try:
-        r=requests.get('https://api.tradingeconomics.com/calendar/country/'+requests.utils.quote(country,safe=''),params={'c':'guest:guest' if key=='GUEST' else key,'f':'json'},timeout=15)
+        r=requests.get('https://api.tradingeconomics.com/calendar/country/'+requests.utils.quote(country,safe=''),params={'c':'guest:guest' if key=='GUEST' else key,'f':'json'},timeout=8)
         if r.status_code>=400: return jsonify(ok=False,error='Calendar provider returned HTTP '+str(r.status_code),provider='Trading Economics'),502
         data=r.json()
         return jsonify(ok=True,provider='Trading Economics',country=country,events=data[:100])
@@ -451,7 +491,7 @@ def mt5_heartbeat():
     license_ok=True
     if u:
         license_ok = (u['status']=='APPROVED' and u['email_verified']==1)
-        if u['membership']!='LIFETIME' and u['membership_expiry']:
+        if u['membership'] not in LIFETIME_PLANS and u['membership_expiry']:
             try:
                 if datetime.fromisoformat(u['membership_expiry'])<now(): license_ok=False
             except ValueError: pass
@@ -539,11 +579,18 @@ def admin_payment():
     d=request.get_json(force=True); pid=int(d['payment_id']); status=d.get('status','').upper(); c=db(); p=c.execute('SELECT payments.*,users.email,users.full_name FROM payments JOIN users ON users.id=payments.user_id WHERE payments.id=?',(pid,)).fetchone()
     if not p: c.close(); return jsonify(ok=False,error='Payment not found'),404
     if status not in ('APPROVED','REJECTED'): c.close(); return jsonify(ok=False,error='Invalid status'),400
+    if p['status']!='PENDING': c.close(); return jsonify(ok=False,error='This request was already processed'),400
     if status=='APPROVED' and p['kind']=='WITHDRAWAL':
-        bal=c.execute('SELECT wallet_balance FROM users WHERE id=?',(p['user_id'],)).fetchone()['wallet_balance']
+        ub=c.execute('SELECT wallet_balance,commission_credit FROM users WHERE id=?',(p['user_id'],)).fetchone()
+        bal=float(ub['wallet_balance'] or 0); free=bal-float(ub['commission_credit'] or 0)
         if bal<p['amount']: c.close(); return jsonify(ok=False,error='Insufficient wallet balance'),400
+        if free<p['amount']: c.close(); return jsonify(ok=False,error='Commission credits cannot be withdrawn. Withdrawable balance: '+str(round(max(free,0),2))),400
     c.execute('UPDATE payments SET status=? WHERE id=?',(status,pid))
-    if status=='APPROVED': c.execute('UPDATE users SET wallet_balance=wallet_balance+? WHERE id=?',((p['amount'] if p['kind']=='DEPOSIT' else -p['amount']),p['user_id']))
+    if status=='APPROVED':
+        delta=p['amount'] if p['kind']=='DEPOSIT' else -p['amount']
+        c.execute('UPDATE users SET wallet_balance=COALESCE(wallet_balance,0)+? WHERE id=?',(delta,p['user_id']))
+        ledger(c,p['user_id'],p['kind'],delta,'payment:'+str(pid),p.get('reference') or '')
+    audit(c,'PAYMENT_'+status,'payment #'+str(pid)+' '+p['kind']+' '+str(p['amount']))
     c.commit(); c.close(); send_email(p['email'],'GOLD MASTERS request update',f'Your {p["kind"].lower()} request #{pid} is {status}.'); return jsonify(ok=True,status=status)
 
 @app.post('/api/admin/signal')
@@ -557,13 +604,19 @@ def admin_signal():
 def admin_membership():
     if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
     d=request.get_json(force=True); email=d.get('email','').strip().lower(); membership=d.get('membership','').upper()
-    if membership not in ('FREE','MONTHLY','SIX_MONTH','YEARLY','LIFETIME'): return jsonify(ok=False,error='Invalid membership'),400
-    expiry=d.get('membership_expiry')
-    c=db(); u=c.execute('SELECT id,email FROM users WHERE LOWER(email)=? OR LOWER(username)=? OR telegram_chat_id=?',(email,email,email)).fetchone()
+    if membership!='FREE' and membership not in PLAN_DAYS: return jsonify(ok=False,error='Invalid membership'),400
+    expiry=d.get('membership_expiry') or None
+    if not expiry and membership!='FREE' and PLAN_DAYS.get(membership): expiry=(now()+timedelta(days=PLAN_DAYS[membership])).isoformat()   # blank = automatic from the plan
+    if membership=='FREE' or membership in LIFETIME_PLANS: expiry=None if not d.get('membership_expiry') else expiry
+    c=db(); u=c.execute('SELECT id,email,telegram_chat_id FROM users WHERE LOWER(email)=? OR LOWER(username)=? OR telegram_chat_id=?',(email,email,email)).fetchone()
     if not u: c.close(); return jsonify(ok=False,error='User not found (use username, Telegram ID or email)'),404
     email=u['email']
     c.execute('UPDATE users SET membership=?, membership_expiry=? WHERE email=?',(membership,expiry,email)); c.commit(); c.close()
-    send_email(email,'GOLD MASTERS membership update',f'Your membership is now: {membership}'+(f' (expires {expiry})' if expiry else ''))
+    msg_=f'Your membership is now: {membership}'+(f' (expires {expiry[:10]})' if expiry else (' (lifetime)' if membership in LIFETIME_PLANS else ''))
+    if u.get('telegram_chat_id'):
+        try: send_telegram(u['telegram_chat_id'],'GOLD MASTERS membership update\n'+msg_+('\nAUTO mode is included in your plan.' if membership in AUTO_PLANS else ''))
+        except Exception: pass
+    if not email.endswith('@telegram.user'): send_email(email,'GOLD MASTERS membership update',msg_)
     return jsonify(ok=True,membership=membership,membership_expiry=expiry)
 
 @app.post('/api/admin/mt5-account')
@@ -582,19 +635,20 @@ def mt5_verify():
     if not account or not key: return jsonify(ok=False,error='Missing account or key'),400
     c=db(); u=c.execute('SELECT * FROM users WHERE mt5_account=? AND license_key=?',(account,key)).fetchone()
     ctl=c.execute('SELECT enabled FROM bot_control WHERE mt5_account=?',(account,)).fetchone() if u else None
+    bm=c.execute('SELECT mode,seq FROM bot_mode WHERE mt5_account=?',(account,)).fetchone() if u else None
     c.close()
     if not u: return jsonify(ok=False,error='Invalid account or license key'),401
     enabled=bool(ctl['enabled']) if ctl else True   # admin can pause one customer's EA; default ON
     active=(u['status']=='APPROVED' and u['email_verified']==1)
     expired=False
-    if u['membership']!='LIFETIME' and u['membership_expiry']:
+    if u['membership'] not in LIFETIME_PLANS and u['membership_expiry']:
         try:
             if datetime.fromisoformat(u['membership_expiry'])<now(): expired=True
         except ValueError: pass
     if expired: active=False
-    auto_allowed=active and u['membership'] in ('YEARLY','LIFETIME')
+    auto_allowed=active and u['membership'] in AUTO_PLANS
     return jsonify(ok=True,active=active,expired=expired,status=u['status'],membership=u['membership'],
-                   membership_expiry=u['membership_expiry'],wallet_balance=u['wallet_balance'],auto_allowed=auto_allowed,enabled=enabled,
+                   membership_expiry=u['membership_expiry'],wallet_balance=u['wallet_balance'],auto_allowed=auto_allowed,enabled=enabled,mode=(bm['mode'] if bm else 'MANUAL'),mode_seq=(bm['seq'] if bm else 0),
                    latest_version=os.getenv('EA_LATEST_VERSION','').strip(),download_url=os.getenv('EA_DOWNLOAD_URL','').strip())
 
 
@@ -876,7 +930,7 @@ def ai_facts():
     key=os.getenv('TWELVEDATA_API_KEY','').strip()
     if key:
         try:
-            r=requests.get('https://api.twelvedata.com/time_series',params={'symbol':'XAU/USD','interval':'1h','outputsize':120,'apikey':key},timeout=15).json()
+            r=requests.get('https://api.twelvedata.com/time_series',params={'symbol':'XAU/USD','interval':'1h','outputsize':120,'apikey':key},timeout=7).json()
             vals=list(reversed(r.get('values') or []))
             if len(vals)>=60:
                 cl=[float(x['close']) for x in vals]; hi=[float(x['high']) for x in vals]; lo=[float(x['low']) for x in vals]
@@ -924,7 +978,7 @@ def ai_llm_text(f,lang):
     if lang=='am': system+=' Write the whole answer in Amharic (አማርኛ, Ethiopic script). Keep numbers in digits.'
     try:
         r=requests.post('https://api.anthropic.com/v1/messages',headers={'x-api-key':key,'anthropic-version':'2023-06-01','content-type':'application/json'},
-            json={'model':os.getenv('AI_MODEL','claude-sonnet-5-5'),'max_tokens':700,'system':system,'messages':[{'role':'user','content':'Facts:\n'+json.dumps(f)}]},timeout=40)
+            json={'model':os.getenv('AI_MODEL','claude-sonnet-5-5'),'max_tokens':700,'system':system,'messages':[{'role':'user','content':'Facts:\n'+json.dumps(f)}]},timeout=17)
         if r.status_code>=400:
             print('ai_llm error',r.status_code,r.text[:200]); return None
         t=''.join(b.get('text','') for b in r.json().get('content',[]) if b.get('type')=='text').strip()
@@ -946,6 +1000,278 @@ def ai_brief():
     data={'text':text,'source':source,'facts':f,'generated_at':now().isoformat(),'lang':lang}
     AI_CACHE[lang]={'t':time.time(),'data':data}
     return jsonify(ok=True,cached=False,**data)
+
+
+# ---------------- Remote AUTO / MANUAL mode switch (website -> EA) ----------------
+def member_auto_allowed(u):
+    if u['status']!='APPROVED' or u['email_verified']!=1: return False
+    if u['membership'] not in AUTO_PLANS: return False
+    if u['membership'] not in LIFETIME_PLANS and u['membership_expiry']:
+        try:
+            if datetime.fromisoformat(u['membership_expiry'])<now(): return False
+        except ValueError: pass
+    return True
+
+@app.get('/api/bot/mode')
+def bot_mode_get():
+    u,err=ea_user()
+    if err: return err
+    acc=str(u['mt5_account'] or '')
+    c=db()
+    bm=c.execute('SELECT mode,seq,updated_at FROM bot_mode WHERE mt5_account=?',(acc,)).fetchone()
+    st=c.execute('SELECT state,version,balance,equity,positions,updated_at FROM bot_status WHERE mt5_account=?',(acc,)).fetchone()
+    ctl=c.execute('SELECT enabled FROM bot_control WHERE mt5_account=?',(acc,)).fetchone()
+    c.close()
+    online=False; state=''; ver=''; seen=''
+    if st:
+        state=st['state'] or ''; ver=st['version'] or ''; seen=st['updated_at'] or ''
+        try:
+            t=datetime.fromisoformat(seen); t=t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+            online=(now()-t).total_seconds()<180
+        except Exception: pass
+    return jsonify(ok=True,requested=(bm['mode'] if bm else 'MANUAL'),requested_at=(bm['updated_at'] if bm else ''),auto_allowed=member_auto_allowed(u),auto_plans=auto_plan_text(),
+                   paused=bool(ctl) and not bool(ctl['enabled']),online=online,state=state,version=ver,last_seen=seen,
+                   balance=(st['balance'] if st else None),equity=(st['equity'] if st else None),positions=(st['positions'] if st else None))
+
+@app.post('/api/bot/mode')
+def bot_mode_set():
+    u,err=ea_user()
+    if err: return err
+    if not rate_ok('botmode:'+str(u['id']),20,600): return jsonify(ok=False,error='Too many changes. Please wait a few minutes.'),429
+    d=request.get_json(force=True,silent=True) or {}; mode=str(d.get('mode','')).upper()
+    if mode not in ('AUTO','MANUAL','OFF'): return jsonify(ok=False,error='Invalid mode'),400
+    if not u['mt5_account']: return jsonify(ok=False,error='No MT5 account on your profile'),400
+    if mode=='AUTO' and not member_auto_allowed(u):
+        return jsonify(ok=False,error='AUTO mode is included in these plans: '+auto_plan_text()+'. Please upgrade.'),403
+    acc=str(u['mt5_account'])
+    c=db()
+    c.execute("INSERT INTO bot_mode(mt5_account,mode,seq,updated_at) VALUES(?,?,1,?) ON CONFLICT(mt5_account) DO UPDATE SET mode=EXCLUDED.mode,seq=bot_mode.seq+1,updated_at=EXCLUDED.updated_at",(acc,mode,now().isoformat()))
+    c.commit(); c.close()
+    if u.get('telegram_chat_id'):
+        try: send_telegram(u['telegram_chat_id'],'GOLD MASTERS: bot mode set to '+mode+' from the website. The EA applies it within about a minute. If this was not you, change your password and contact support.')
+        except Exception: pass
+    return jsonify(ok=True,requested=mode,message='Mode request saved. The EA applies it within about a minute.')
+
+
+# ================= Wallet ledger, membership orders and 25% referral commissions =================
+REF_RATE=0.25
+SITE_URL=os.getenv('SITE_URL','https://goldmasterbot.pages.dev').rstrip('/')
+PARTNER_PLANS=('PLATINUM','DIAMOND','YEARLY','LIFETIME')      # active members of these plans are Referral Partners
+PLAN_RANK={'MONTHLY':1,'BRONZE':1,'SILVER':2,'SIX_MONTH':2,'GOLD':3,'YEARLY':4,'PLATINUM':4,'DIAMOND':5,'LIFETIME':5}
+def audit(c,action,detail=''): c.execute('INSERT INTO admin_audit(action,detail,created_at) VALUES(?,?,?)',(action,str(detail)[:500],now().isoformat()))
+def ledger(c,uid,kind,amount,ref='',note=''):
+    bal=c.execute('SELECT wallet_balance FROM users WHERE id=?',(uid,)).fetchone()['wallet_balance'] or 0
+    c.execute('INSERT INTO wallet_ledger(user_id,kind,amount,balance_after,ref,note,created_at) VALUES(?,?,?,?,?,?,?)',(uid,kind,round(float(amount),2),round(float(bal),2),ref,str(note)[:200],now().isoformat()))
+def plan_active(u):
+    if u['membership'] not in PAID_PLANS: return False
+    if u['membership'] in LIFETIME_PLANS or not u['membership_expiry']: return True
+    try: return datetime.fromisoformat(u['membership_expiry'])>=now()
+    except ValueError: return True
+def is_partner(u): return u['status']=='APPROVED' and u['membership'] in PARTNER_PLANS and plan_active(u)
+def ensure_ref_code(u):
+    if u.get('referral_code'): return u['referral_code']
+    for _ in range(8):
+        code=''.join(secrets.choice('ABCDEFGHJKLMNPQRSTUVWXYZ23456789') for _ in range(8))
+        c=db()
+        try:
+            c.execute('UPDATE users SET referral_code=? WHERE id=? AND referral_code IS NULL',(code,u['id'])); c.commit(); c.close()
+            r=rows('SELECT referral_code FROM users WHERE id=?',(u['id'],)); return (r[0]['referral_code'] if r else '') or ''
+        except psycopg2.IntegrityError:
+            c.close()
+    return ''
+def tg_user(uid,text):
+    try:
+        r=rows('SELECT telegram_chat_id FROM users WHERE id=?',(uid,))
+        if r and r[0]['telegram_chat_id']: send_telegram(r[0]['telegram_chat_id'],text)
+    except Exception as e: print('tg_user failed:',e)
+
+def credit_commission(c,cid):
+    cm=c.execute("SELECT * FROM commissions WHERE id=? AND status='PENDING'",(cid,)).fetchone()
+    if not cm: return None
+    c.execute("UPDATE commissions SET status='CREDITED',decided_at=? WHERE id=?",(now().isoformat(),cid))
+    c.execute('UPDATE users SET wallet_balance=COALESCE(wallet_balance,0)+?,commission_credit=COALESCE(commission_credit,0)+? WHERE id=?',(cm['amount'],cm['amount'],cm['referrer_id']))
+    ledger(c,cm['referrer_id'],'COMMISSION',cm['amount'],'commission:'+str(cid),cm['plan']+' referral 25%')
+    return cm
+
+def create_commission(c,o,buyer):
+    if not buyer['referred_by'] or o['plan'] not in PRICING: return
+    ref=c.execute('SELECT * FROM users WHERE id=?',(buyer['referred_by'],)).fetchone()
+    if not ref or ref['id']==buyer['id']: return
+    if (ref['telegram_chat_id'] and ref['telegram_chat_id']==buyer['telegram_chat_id']) or (ref['mt5_account'] and ref['mt5_account']==buyer['mt5_account']): return
+    if not is_partner(ref): return
+    if os.getenv('COMMISSION_FIRST_ONLY','0')=='1' and c.execute('SELECT 1 AS x FROM commissions WHERE referred_id=? LIMIT 1',(buyer['id'],)).fetchone(): return
+    basis=round(float(o['price'])-float(o['commission_used']),2)      # the part paid with commission credits earns no commission
+    if basis<=0: return
+    amt=round(basis*REF_RATE,2)
+    c.execute('INSERT INTO commissions(order_id,referrer_id,referred_id,plan,basis,rate,amount,created_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(order_id) DO NOTHING',(o['id'],ref['id'],buyer['id'],o['plan'],basis,REF_RATE,amt,now().isoformat()))
+    if os.getenv('COMMISSION_AUTO','0')=='1':
+        cm=c.execute('SELECT id FROM commissions WHERE order_id=?',(o['id'],)).fetchone()
+        if cm: credit_commission(c,cm['id'])
+
+def approve_order(c,oid):
+    o=c.execute("SELECT * FROM orders WHERE id=? AND status='PENDING'",(oid,)).fetchone()
+    if not o: return None
+    u=c.execute('SELECT * FROM users WHERE id=?',(o['user_id'],)).fetchone()
+    days=PLAN_DAYS.get(o['plan']); base=now()
+    if u['membership']==o['plan'] and u['membership_expiry'] and o['plan'] not in LIFETIME_PLANS:
+        try: base=max(base,datetime.fromisoformat(u['membership_expiry']))
+        except ValueError: pass
+    expiry=None if days is None else (base+timedelta(days=days)).isoformat()
+    c.execute('UPDATE users SET membership=?,membership_expiry=? WHERE id=?',(o['plan'],expiry,u['id']))
+    c.execute("UPDATE orders SET status='APPROVED',decided_at=? WHERE id=?",(now().isoformat(),oid))
+    create_commission(c,o,u)
+    return expiry or 'LIFETIME'
+
+def reject_order(c,oid):
+    o=c.execute("SELECT * FROM orders WHERE id=? AND status='PENDING'",(oid,)).fetchone()
+    if not o: return False
+    c.execute("UPDATE orders SET status='REJECTED',decided_at=? WHERE id=?",(now().isoformat(),oid))
+    if o['wallet_amount']>0:
+        c.execute('UPDATE users SET wallet_balance=COALESCE(wallet_balance,0)+?,commission_credit=COALESCE(commission_credit,0)+? WHERE id=?',(o['wallet_amount'],o['commission_used'],o['user_id']))
+        ledger(c,o['user_id'],'PURCHASE_REFUND',o['wallet_amount'],'order:'+str(oid),o['plan'])
+    return True
+
+@app.post('/api/order')
+def order_create():
+    u,err=ea_user()
+    if err: return err
+    if not rate_ok('order:'+str(u['id']),10,3600): return jsonify(ok=False,error='Too many attempts. Please try again later.'),429
+    d=request.get_json(force=True,silent=True) or {}; plan=str(d.get('plan','')).upper()
+    if plan not in PRICING: return jsonify(ok=False,error='Choose a membership plan'),400
+    price=float(PRICING[plan])
+    cur=u['membership']
+    if plan_active(u) and PLAN_RANK.get(cur,0)>PLAN_RANK.get(plan,0): return jsonify(ok=False,error='You already have a higher plan ('+cur+')'),400
+    if cur in LIFETIME_PLANS and plan_active(u): return jsonify(ok=False,error='You already have a lifetime plan'),400
+    try: use=round(max(0.0,min(float(d.get('wallet_amount') or 0),price)),2)
+    except (TypeError,ValueError): return jsonify(ok=False,error='Invalid wallet amount'),400
+    crypto=round(price-use,2); net=str(d.get('network','')).upper(); txid=str(d.get('txid','')).strip()
+    if crypto>0:
+        if net not in ('BEP20','TRC20'): return jsonify(ok=False,error='Choose the payment network (BEP20 or TRC20)'),400
+        if not re.fullmatch(r'(0x)?[0-9a-fA-F]{64}',txid): return jsonify(ok=False,error='Enter a valid transaction hash (TXID)'),400
+    else: net=''; txid=''
+    c=db()
+    try:
+        if c.execute("SELECT 1 AS x FROM orders WHERE user_id=? AND status='PENDING' LIMIT 1",(u['id'],)).fetchone(): c.close(); return jsonify(ok=False,error='You already have an order waiting for approval'),409
+        if txid and (c.execute('SELECT 1 AS x FROM payments WHERE LOWER(reference)=? LIMIT 1',(txid.lower(),)).fetchone() or c.execute('SELECT 1 AS x FROM orders WHERE LOWER(txid)=? LIMIT 1',(txid.lower(),)).fetchone()):
+            c.close(); return jsonify(ok=False,error='This transaction ID was already submitted'),409
+        cu=0.0
+        if use>0:
+            fresh=c.execute('SELECT COALESCE(commission_credit,0) AS cc FROM users WHERE id=?',(u['id'],)).fetchone()
+            cu=round(min(float(fresh['cc']),use),2)
+            got=c.execute('UPDATE users SET wallet_balance=wallet_balance-?,commission_credit=COALESCE(commission_credit,0)-? WHERE id=? AND COALESCE(wallet_balance,0)>=?',(use,cu,u['id'],use))
+            if got.rowcount!=1: c.close(); return jsonify(ok=False,error='Not enough wallet balance'),400
+        oid=c.execute('INSERT INTO orders(user_id,plan,price,wallet_amount,commission_used,crypto_amount,network,txid,created_at) VALUES(?,?,?,?,?,?,?,?,?) RETURNING id',(u['id'],plan,price,use,cu,crypto,net or None,txid or None,now().isoformat())).fetchone()['id']
+        if use>0: ledger(c,u['id'],'PURCHASE_HOLD',-use,'order:'+str(oid),plan)
+        done=None
+        if crypto==0: done=approve_order(c,oid); audit(c,'ORDER_AUTO_APPROVED','order #'+str(oid)+' '+plan+' wallet-only')
+        c.commit(); c.close()
+    except psycopg2.IntegrityError:
+        try: c.close()
+        except Exception: pass
+        return jsonify(ok=False,error='This transaction ID was already submitted'),409
+    if done:
+        tg_user(u['id'],'GOLD MASTERS: your '+plan+' membership is active ('+('lifetime' if done=='LIFETIME' else 'until '+done[:10])+').')
+        return jsonify(ok=True,status='APPROVED',message='Membership activated.')
+    admin_email('New membership order #'+str(oid),'User: '+u['full_name']+' (@'+u['username']+')\nPlan: '+plan+' $'+str(price)+'\nFrom wallet: $'+str(use)+'\nCrypto: $'+str(crypto)+' '+net+'\nTXID: '+txid)
+    return jsonify(ok=True,status='PENDING',message='Order sent. The admin will verify your payment and activate your membership.')
+
+@app.get('/api/wallet')
+def wallet_get():
+    u=auth_user()
+    if not u: return jsonify(ok=False,error='Please log in again'),401
+    code=ensure_ref_code(u)
+    c=db()
+    one=lambda q,pp=(): c.execute(q,pp).fetchone()
+    bal=float(u['wallet_balance'] or 0); cc=float(u['commission_credit'] or 0)
+    pend=one("SELECT COALESCE(SUM(amount),0) AS s FROM commissions WHERE referrer_id=? AND status='PENDING'",(u['id'],))['s']
+    earned=one("SELECT COALESCE(SUM(amount),0) AS s FROM commissions WHERE referrer_id=? AND status='CREDITED'",(u['id'],))['s']
+    spent=one("SELECT COALESCE(SUM(wallet_amount),0) AS s FROM orders WHERE user_id=? AND status='APPROVED'",(u['id'],))['s']
+    held=one("SELECT COALESCE(SUM(wallet_amount),0) AS s FROM orders WHERE user_id=? AND status='PENDING'",(u['id'],))['s']
+    partner=is_partner(u)
+    refs=c.execute("SELECT full_name,status,membership,created_at FROM users WHERE referred_by=? ORDER BY id DESC LIMIT 50",(u['id'],)).fetchall()
+    for r in refs:
+        n=(r['full_name'] or '').split(); r['full_name']=(n[0]+' '+n[1][0]+'.') if len(n)>1 else (n[0] if n else '')
+    out=dict(ok=True,available=round(bal,2),withdrawable=round(max(bal-cc,0),2),pending_commission=round(float(pend),2),total_earned=round(float(earned),2),total_spent=round(float(spent),2),on_hold=round(float(held),2),
+        is_partner=partner,referral_code=code,referral_link=(SITE_URL+'/?ref='+code if partner and code else ''),rate=int(REF_RATE*100),
+        referrals=refs,
+        commissions=c.execute('SELECT plan,basis,amount,status,created_at FROM commissions WHERE referrer_id=? ORDER BY id DESC LIMIT 50',(u['id'],)).fetchall(),
+        ledger=c.execute('SELECT kind,amount,balance_after,note,created_at FROM wallet_ledger WHERE user_id=? ORDER BY id DESC LIMIT 50',(u['id'],)).fetchall(),
+        orders=c.execute('SELECT id,plan,price,wallet_amount,crypto_amount,status,created_at FROM orders WHERE user_id=? ORDER BY id DESC LIMIT 10',(u['id'],)).fetchall(),
+        membership=u['membership'],membership_expiry=u['membership_expiry'])
+    c.close(); return jsonify(out)
+
+# ---------------- admin: orders, commissions, wallet adjustments, audit log ----------------
+@app.get('/api/admin/orders')
+def admin_orders():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    return jsonify(ok=True,orders=rows('SELECT o.*,u.full_name,u.username,u.phone,u.telegram_chat_id FROM orders o JOIN users u ON u.id=o.user_id ORDER BY o.id DESC LIMIT 200'))
+
+@app.post('/api/admin/order-status')
+def admin_order_status():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True,silent=True) or {}; status=str(d.get('status','')).upper()
+    try: oid=int(d.get('order_id'))
+    except (TypeError,ValueError): return jsonify(ok=False,error='Invalid order'),400
+    if status not in ('APPROVED','REJECTED'): return jsonify(ok=False,error='Invalid status'),400
+    c=db(); o=c.execute('SELECT * FROM orders WHERE id=?',(oid,)).fetchone()
+    if not o: c.close(); return jsonify(ok=False,error='Order not found'),404
+    if o['status']!='PENDING': c.close(); return jsonify(ok=False,error='This order was already processed'),400
+    if status=='APPROVED':
+        exp=approve_order(c,oid); audit(c,'ORDER_APPROVED','order #'+str(oid)+' '+o['plan']); c.commit(); c.close()
+        tg_user(o['user_id'],'GOLD MASTERS: payment approved. Your '+o['plan']+' membership is active ('+('lifetime' if exp=='LIFETIME' else 'until '+str(exp)[:10])+').')
+        return jsonify(ok=True,status='APPROVED',membership_expiry=exp)
+    reject_order(c,oid); audit(c,'ORDER_REJECTED','order #'+str(oid)+' '+o['plan']); c.commit(); c.close()
+    tg_user(o['user_id'],'GOLD MASTERS: your order #'+str(oid)+' was rejected. Any wallet amount was returned. Contact support if you think this is a mistake.')
+    return jsonify(ok=True,status='REJECTED')
+
+@app.get('/api/admin/commissions')
+def admin_commissions():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    cms=rows('SELECT m.*,r.full_name AS referrer,r.username AS referrer_user,b.full_name AS buyer FROM commissions m JOIN users r ON r.id=m.referrer_id JOIN users b ON b.id=m.referred_id ORDER BY m.id DESC LIMIT 200')
+    partners=rows("SELECT u.id,u.full_name,u.username,u.telegram_chat_id,u.membership,u.membership_expiry,u.referral_code,(SELECT COUNT(*) FROM users x WHERE x.referred_by=u.id) AS referred FROM users u WHERE u.status='APPROVED' AND u.membership IN ('PLATINUM','DIAMOND','YEARLY','LIFETIME') ORDER BY u.id DESC LIMIT 200")
+    return jsonify(ok=True,commissions=cms,partners=partners)
+
+@app.post('/api/admin/commission-status')
+def admin_commission_status():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True,silent=True) or {}; status=str(d.get('status','')).upper()
+    try: cid=int(d.get('id'))
+    except (TypeError,ValueError): return jsonify(ok=False,error='Invalid commission'),400
+    if status not in ('APPROVED','REJECTED'): return jsonify(ok=False,error='Invalid status'),400
+    c=db()
+    if status=='APPROVED':
+        cm=credit_commission(c,cid)
+        if not cm: c.close(); return jsonify(ok=False,error='Commission not found or already processed'),400
+        audit(c,'COMMISSION_CREDITED','commission #'+str(cid)+' $'+str(cm['amount'])); c.commit(); c.close()
+        tg_user(cm['referrer_id'],'GOLD MASTERS: your referral commission of $'+str(cm['amount'])+' was added to your wallet.')
+    else:
+        got=c.execute("UPDATE commissions SET status='REJECTED',decided_at=? WHERE id=? AND status='PENDING'",(now().isoformat(),cid))
+        if got.rowcount!=1: c.close(); return jsonify(ok=False,error='Commission not found or already processed'),400
+        audit(c,'COMMISSION_REJECTED','commission #'+str(cid)); c.commit(); c.close()
+    return jsonify(ok=True,status=status)
+
+@app.post('/api/admin/wallet-adjust')
+def admin_wallet_adjust():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    d=request.get_json(force=True,silent=True) or {}
+    u=find_user_by_ident(str(d.get('user','')))
+    note=str(d.get('note','')).strip()
+    try: amt=round(float(d.get('amount')),2)
+    except (TypeError,ValueError): return jsonify(ok=False,error='Enter an amount'),400
+    if not u: return jsonify(ok=False,error='User not found'),404
+    if not note: return jsonify(ok=False,error='A note (reason) is required'),400
+    if amt==0 or abs(amt)>100000: return jsonify(ok=False,error='Invalid amount'),400
+    c=db()
+    got=c.execute('UPDATE users SET wallet_balance=COALESCE(wallet_balance,0)+? WHERE id=? AND COALESCE(wallet_balance,0)+?>=0',(amt,u['id'],amt))
+    if got.rowcount!=1: c.close(); return jsonify(ok=False,error='Balance cannot go below zero'),400
+    c.execute('UPDATE users SET commission_credit=LEAST(COALESCE(commission_credit,0),wallet_balance) WHERE id=?',(u['id'],))
+    ledger(c,u['id'],'ADJUSTMENT',amt,'admin',note); audit(c,'WALLET_ADJUST','user '+u['username']+' '+str(amt)+' | '+note); c.commit(); c.close()
+    return jsonify(ok=True)
+
+@app.get('/api/admin/audit')
+def admin_audit_log():
+    if not admin_ok(): return jsonify(ok=False,error='Unauthorized'),401
+    return jsonify(ok=True,log=rows('SELECT action,detail,created_at FROM admin_audit ORDER BY id DESC LIMIT 100'))
 
 @app.get('/api/health')
 def health(): return jsonify(ok=True,service='GOLD MASTERS API',time=now().isoformat())
